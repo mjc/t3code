@@ -126,6 +126,15 @@ const PROVIDER_SETTINGS: readonly InstallProviderSettings[] = [
     homeDescription: "Optional custom Codex home and config directory.",
   },
   {
+    provider: "copilot",
+    title: "Copilot",
+    binaryPlaceholder: "Bundled Copilot CLI",
+    binaryDescription:
+      "Optional path to a GitHub Copilot CLI binary. Leave blank to use the SDK-bundled CLI.",
+    serverUrlPlaceholder: "http://127.0.0.1:3000",
+    serverUrlDescription: "Leave blank to let T3 Code start the SDK-bundled Copilot server.",
+  },
+  {
     provider: "claudeAgent",
     title: "Claude",
     binaryPlaceholder: "Claude binary path",
@@ -546,6 +555,13 @@ export function GeneralSettingsPanel() {
       settings.providers.codex.homePath !== DEFAULT_UNIFIED_SETTINGS.providers.codex.homePath ||
       settings.providers.codex.customModels.length > 0,
     ),
+    copilot: Boolean(
+      settings.providers.copilot.binaryPath !==
+        DEFAULT_UNIFIED_SETTINGS.providers.copilot.binaryPath ||
+      settings.providers.copilot.serverUrl !==
+        DEFAULT_UNIFIED_SETTINGS.providers.copilot.serverUrl ||
+      settings.providers.copilot.customModels.length > 0,
+    ),
     claudeAgent: Boolean(
       settings.providers.claudeAgent.binaryPath !==
         DEFAULT_UNIFIED_SETTINGS.providers.claudeAgent.binaryPath ||
@@ -571,6 +587,7 @@ export function GeneralSettingsPanel() {
     Record<ProviderKind, string>
   >({
     codex: "",
+    copilot: "",
     claudeAgent: "",
     cursor: "",
     opencode: "",
@@ -1361,7 +1378,8 @@ export function GeneralSettingsPanel() {
                                   ...settings.providers,
                                   [providerCard.provider]: {
                                     ...settings.providers[providerCard.provider],
-                                    ...(providerCard.provider === "opencode"
+                                    ...(providerCard.provider === "opencode" ||
+                                    providerCard.provider === "copilot"
                                       ? { serverUrl: event.target.value }
                                       : {}),
                                   },
@@ -1610,9 +1628,11 @@ export function GeneralSettingsPanel() {
                           placeholder={
                             providerCard.provider === "codex"
                               ? "gpt-6.7-codex-ultra-preview"
-                              : providerCard.provider === "opencode"
-                                ? "openai/gpt-5"
-                                : "claude-sonnet-5-0"
+                              : providerCard.provider === "copilot"
+                                ? "gpt-4.1"
+                                : providerCard.provider === "opencode"
+                                  ? "openai/gpt-5"
+                                  : "claude-sonnet-5-0"
                           }
                           spellCheck={false}
                         />

@@ -14,6 +14,7 @@ export type ProviderSnapshotSource = {
 type BuiltInProviderServiceMap = Record<ProviderKind, ServerProviderShape>;
 type BuiltInAdapterMap = {
   readonly codex: ProviderAdapterShape<ProviderAdapterError>;
+  readonly copilot?: ProviderAdapterShape<ProviderAdapterError>;
   readonly claudeAgent: ProviderAdapterShape<ProviderAdapterError>;
   readonly opencode: ProviderAdapterShape<ProviderAdapterError>;
   readonly cursor?: ProviderAdapterShape<ProviderAdapterError>;
@@ -21,6 +22,7 @@ type BuiltInAdapterMap = {
 
 export const BUILT_IN_PROVIDER_ORDER = [
   "codex",
+  "copilot",
   "claudeAgent",
   "opencode",
   "cursor",
@@ -42,6 +44,7 @@ export function createBuiltInAdapterList(
 ): ReadonlyArray<ProviderAdapterShape<ProviderAdapterError>> {
   return [
     adapters.codex,
+    ...(adapters.copilot ? [adapters.copilot] : []),
     adapters.claudeAgent,
     adapters.opencode,
     ...(adapters.cursor ? [adapters.cursor] : []),

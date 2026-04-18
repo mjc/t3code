@@ -8,10 +8,12 @@ import { Effect, Equal, FileSystem, Layer, Path, PubSub, Ref, Stream } from "eff
 
 import { ServerConfig } from "../../config.ts";
 import { ClaudeProviderLive } from "./ClaudeProvider.ts";
+import { CopilotProviderLive } from "./CopilotProvider.ts";
 import { CodexProviderLive } from "./CodexProvider.ts";
 import { CursorProviderLive } from "./CursorProvider.ts";
 import { OpenCodeProviderLive } from "./OpenCodeProvider.ts";
 import { ClaudeProvider } from "../Services/ClaudeProvider.ts";
+import { CopilotProvider } from "../Services/CopilotProvider.ts";
 import { CodexProvider } from "../Services/CodexProvider.ts";
 import { CursorProvider } from "../Services/CursorProvider.ts";
 import { OpenCodeProvider } from "../Services/OpenCodeProvider.ts";
@@ -81,6 +83,7 @@ const ProviderRegistryLiveBase = Layer.effect(
   ProviderRegistry,
   Effect.gen(function* () {
     const codexProvider = yield* CodexProvider;
+    const copilotProvider = yield* CopilotProvider;
     const claudeProvider = yield* ClaudeProvider;
     const openCodeProvider = yield* OpenCodeProvider;
     const config = yield* ServerConfig;
@@ -91,6 +94,7 @@ const ProviderRegistryLiveBase = Layer.effect(
 
     const providerSources = createBuiltInProviderSources({
       codex: codexProvider,
+      copilot: copilotProvider,
       claudeAgent: claudeProvider,
       opencode: openCodeProvider,
       cursor: cursorProvider,
@@ -257,6 +261,7 @@ export const ProviderRegistryLive = Layer.unwrap(
     ProviderRegistryLiveBase.pipe(
       Layer.provideMerge(CursorProviderLive),
       Layer.provideMerge(CodexProviderLive),
+      Layer.provideMerge(CopilotProviderLive),
       Layer.provideMerge(ClaudeProviderLive),
       Layer.provideMerge(OpenCodeProviderLive),
       Layer.provideMerge(OpenCodeRuntimeLive),

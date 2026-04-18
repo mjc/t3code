@@ -6,6 +6,7 @@ import { writeFileStringAtomically } from "../atomicWrite.ts";
 
 export const PROVIDER_CACHE_IDS = [
   "codex",
+  "copilot",
   "claudeAgent",
   "opencode",
   "cursor",

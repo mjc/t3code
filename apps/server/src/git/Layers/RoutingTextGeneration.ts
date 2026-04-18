@@ -14,6 +14,7 @@ import { Effect, Layer, Context } from "effect";
 import { TextGeneration, type TextGenerationShape } from "../Services/TextGeneration.ts";
 import { CodexTextGenerationLive } from "./CodexTextGeneration.ts";
 import { ClaudeTextGenerationLive } from "./ClaudeTextGeneration.ts";
+import { CopilotTextGenerationLive } from "./CopilotTextGeneration.ts";
 import { CursorTextGenerationLive } from "./CursorTextGeneration.ts";
 import { OpenCodeTextGenerationLive } from "./OpenCodeTextGeneration.ts";
 
@@ -27,6 +28,10 @@ class CodexTextGen extends Context.Service<CodexTextGen, TextGenerationShape>()(
 
 class ClaudeTextGen extends Context.Service<ClaudeTextGen, TextGenerationShape>()(
   "t3/git/Layers/RoutingTextGeneration/ClaudeTextGen",
+) {}
+
+class CopilotTextGen extends Context.Service<CopilotTextGen, TextGenerationShape>()(
+  "t3/git/Layers/RoutingTextGeneration/CopilotTextGen",
 ) {}
 
 class CursorTextGen extends Context.Service<CursorTextGen, TextGenerationShape>()(
@@ -44,20 +49,24 @@ class OpenCodeTextGen extends Context.Service<OpenCodeTextGen, TextGenerationSha
 const makeRoutingTextGeneration = Effect.gen(function* () {
   const byProvider = {
     codex: yield* CodexTextGen,
+    copilot: yield* CopilotTextGen,
     claudeAgent: yield* ClaudeTextGen,
     cursor: yield* CursorTextGen,
     opencode: yield* OpenCodeTextGen,
   };
 
+  const route = (provider?: keyof typeof byProvider): TextGenerationShape =>
+    byProvider[provider ?? "codex"] ?? byProvider.codex;
+
   return {
     generateCommitMessage: (input) =>
-      byProvider[input.modelSelection.provider].generateCommitMessage(input),
+      route(input.modelSelection.provider).generateCommitMessage(input),
     generatePrContent: (input) =>
-      byProvider[input.modelSelection.provider].generatePrContent(input),
+      route(input.modelSelection.provider).generatePrContent(input),
     generateBranchName: (input) =>
-      byProvider[input.modelSelection.provider].generateBranchName(input),
+      route(input.modelSelection.provider).generateBranchName(input),
     generateThreadTitle: (input) =>
-      byProvider[input.modelSelection.provider].generateThreadTitle(input),
+      route(input.modelSelection.provider).generateThreadTitle(input),
   } satisfies TextGenerationShape;
 });
 
@@ -76,6 +85,14 @@ const InternalClaudeLayer = Layer.effect(
     return svc;
   }),
 ).pipe(Layer.provide(ClaudeTextGenerationLive));
+
+const InternalCopilotLayer = Layer.effect(
+  CopilotTextGen,
+  Effect.gen(function* () {
+    const svc = yield* TextGeneration;
+    return svc;
+  }),
+).pipe(Layer.provide(CopilotTextGenerationLive));
 
 const InternalCursorLayer = Layer.effect(
   CursorTextGen,
@@ -98,6 +115,7 @@ export const RoutingTextGenerationLive = Layer.effect(
   makeRoutingTextGeneration,
 ).pipe(
   Layer.provide(InternalCodexLayer),
+  Layer.provide(InternalCopilotLayer),
   Layer.provide(InternalClaudeLayer),
   Layer.provide(InternalCursorLayer),
   Layer.provide(InternalOpenCodeLayer),
