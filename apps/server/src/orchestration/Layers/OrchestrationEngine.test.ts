@@ -139,11 +139,27 @@ describe("OrchestrationEngine", () => {
         },
       ],
     };
+    const commandReadModel = {
+      ...projectionSnapshot,
+      threads: projectionSnapshot.threads.map((thread) => ({
+        ...thread,
+        messages: [],
+        proposedPlans: [],
+        activities: [],
+        checkpoints: [],
+      })),
+    };
+    let fullSnapshotReadCount = 0;
 
     const layer = OrchestrationEngineLive.pipe(
       Layer.provide(
         Layer.succeed(ProjectionSnapshotQuery, {
-          getSnapshot: () => Effect.succeed(projectionSnapshot),
+          getCommandReadModel: () => Effect.succeed(commandReadModel),
+          getSnapshot: () =>
+            Effect.sync(() => {
+              fullSnapshotReadCount += 1;
+              return projectionSnapshot;
+            }),
           getShellSnapshot: () =>
             Effect.succeed({
               snapshotSequence: projectionSnapshot.snapshotSequence,
@@ -151,6 +167,8 @@ describe("OrchestrationEngine", () => {
               threads: [],
               updatedAt: projectionSnapshot.updatedAt,
             }),
+          getSnapshotSequence: () =>
+            Effect.succeed({ snapshotSequence: projectionSnapshot.snapshotSequence }),
           getCounts: () => Effect.succeed({ projectCount: 1, threadCount: 1 }),
           getActiveProjectByWorkspaceRoot: () => Effect.succeed(Option.none()),
           getProjectShellById: () => Effect.succeed(Option.none()),
@@ -174,8 +192,10 @@ describe("OrchestrationEngine", () => {
     const runtime = ManagedRuntime.make(layer);
 
     const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
+    expect(fullSnapshotReadCount).toBe(0);
     const readModel = await runtime.runPromise(engine.getReadModel());
 
+    expect(fullSnapshotReadCount).toBe(1);
     expect(readModel.snapshotSequence).toBe(7);
     expect(readModel.projects).toHaveLength(1);
     expect(readModel.projects[0]?.title).toBe("Bootstrap Project");
