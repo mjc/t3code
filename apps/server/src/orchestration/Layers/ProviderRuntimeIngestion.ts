@@ -22,6 +22,7 @@ import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/Projectio
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { isGitRepository } from "../../git/Utils.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
+import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import {
   ProviderRuntimeIngestionService,
   type ProviderRuntimeIngestionShape,
@@ -522,6 +523,7 @@ function runtimeEventToActivities(
 
 const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
+  const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
   const projectionTurnRepository = yield* ProjectionTurnRepository;
   const serverSettingsService = yield* ServerSettingsService;
@@ -553,15 +555,35 @@ const make = Effect.gen(function* () {
     lookup: () => Effect.succeed({ text: "", createdAt: "" }),
   });
 
+  const resolveThreadDetail = Effect.fn("resolveThreadDetail")(function* (threadId: ThreadId) {
+    return yield* projectionSnapshotQuery
+      .getThreadDetailById(threadId)
+      .pipe(Effect.map(Option.getOrUndefined));
+  });
+
+  const resolveThreadProjects = Effect.fn("resolveThreadProjects")(function* (threadId: ThreadId) {
+    const thread = yield* resolveThreadDetail(threadId);
+    if (!thread) {
+      return { thread: undefined, projects: [] as const };
+    }
+
+    const project = yield* projectionSnapshotQuery
+      .getProjectShellById(thread.projectId)
+      .pipe(Effect.map(Option.getOrUndefined));
+    return {
+      thread,
+      projects: project ? [project] : [],
+    };
+  });
+
   const isGitRepoForThread = Effect.fn("isGitRepoForThread")(function* (threadId: ThreadId) {
-    const readModel = yield* orchestrationEngine.getReadModel();
-    const thread = readModel.threads.find((entry) => entry.id === threadId);
+    const { thread, projects } = yield* resolveThreadProjects(threadId);
     if (!thread) {
       return false;
     }
     const workspaceCwd = resolveThreadWorkspaceCwd({
       thread,
-      projects: readModel.projects,
+      projects,
     });
     if (!workspaceCwd) {
       return false;
@@ -1070,8 +1092,7 @@ const make = Effect.gen(function* () {
       implementationThreadId: ThreadId,
       implementedAt: string,
     ) {
-      const readModel = yield* orchestrationEngine.getReadModel();
-      const sourceThread = readModel.threads.find((entry) => entry.id === sourceThreadId);
+      const sourceThread = yield* resolveThreadDetail(sourceThreadId);
       const sourcePlan = sourceThread?.proposedPlans.find((entry) => entry.id === sourcePlanId);
       if (!sourceThread || !sourcePlan || sourcePlan.implementedAt !== null) {
         return;
@@ -1096,8 +1117,7 @@ const make = Effect.gen(function* () {
 
   const processRuntimeEvent = (event: ProviderRuntimeEvent) =>
     Effect.gen(function* () {
-      const readModel = yield* orchestrationEngine.getReadModel();
-      const thread = readModel.threads.find((entry) => entry.id === event.threadId);
+      const thread = yield* resolveThreadDetail(event.threadId);
       if (!thread) return;
 
       const now = event.createdAt;
