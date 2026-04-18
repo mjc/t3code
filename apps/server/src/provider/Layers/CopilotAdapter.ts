@@ -1806,6 +1806,26 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             }
             enqueueSdkEvent(context, event);
           };
+          const onSessionPermissionRequest = (_request: PermissionRequest) => {
+            if (!context) {
+              return Promise.resolve({
+                kind:
+                  input.runtimeMode === "approval-required"
+                    ? "denied-interactively-by-user"
+                    : "approved",
+              } satisfies PermissionRequestResult);
+            }
+            return onPermissionRequest(context, _request);
+          };
+          const onSessionUserInputRequest = (_request: CopilotUserInputRequest) => {
+            if (!context) {
+              return Promise.resolve({
+                answer: "",
+                wasFreeform: true,
+              } satisfies CopilotUserInputResponse);
+            }
+            return onUserInputRequest(context, _request);
+          };
 
           const client = createCopilotClient({
             settings,
@@ -1839,14 +1859,14 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
               return resume
                 ? client.resumeSession(resume.sessionId, {
                     ...baseSessionConfig,
-                    onPermissionRequest: (request) => onPermissionRequest(context!, request),
-                    onUserInputRequest: (request) => onUserInputRequest(context!, request),
+                    onPermissionRequest: onSessionPermissionRequest,
+                    onUserInputRequest: onSessionUserInputRequest,
                   })
                 : client.createSession({
                     ...baseSessionConfig,
                     sessionId: input.threadId,
-                    onPermissionRequest: (request) => onPermissionRequest(context!, request),
-                    onUserInputRequest: (request) => onUserInputRequest(context!, request),
+                    onPermissionRequest: onSessionPermissionRequest,
+                    onUserInputRequest: onSessionUserInputRequest,
                   });
             },
             catch: (cause) =>
