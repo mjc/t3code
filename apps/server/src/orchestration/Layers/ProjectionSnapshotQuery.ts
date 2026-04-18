@@ -243,6 +243,37 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const repositoryIdentityResolver = yield* RepositoryIdentityResolver;
   const repositoryIdentityResolutionConcurrency = 4;
+  const resolveRepositoryIdentitiesForProjects = Effect.fn(
+    "ProjectionSnapshotQuery.resolveRepositoryIdentitiesForProjects",
+  )(function* (
+    projectRows: ReadonlyArray<Schema.Schema.Type<typeof ProjectionProjectDbRowSchema>>,
+    options?: {
+      readonly includeDeleted?: boolean;
+    },
+  ) {
+    const filteredProjectRows =
+      options?.includeDeleted === true
+        ? projectRows
+        : projectRows.filter((row) => row.deletedAt === null);
+    const uniqueWorkspaceRoots = [...new Set(filteredProjectRows.map((row) => row.workspaceRoot))];
+    const repositoryIdentityByWorkspaceRoot = new Map(
+      yield* Effect.forEach(
+        uniqueWorkspaceRoots,
+        (workspaceRoot) =>
+          repositoryIdentityResolver
+            .resolve(workspaceRoot)
+            .pipe(Effect.map((identity) => [workspaceRoot, identity] as const)),
+        { concurrency: repositoryIdentityResolutionConcurrency },
+      ),
+    );
+
+    return new Map(
+      filteredProjectRows.map((row) => [
+        row.projectId,
+        repositoryIdentityByWorkspaceRoot.get(row.workspaceRoot) ?? null,
+      ]),
+    );
+  });
 
   const listProjectRows = SqlSchema.findAll({
     Request: Schema.Void,
@@ -904,15 +935,9 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 });
               }
 
-              const repositoryIdentities = new Map(
-                yield* Effect.forEach(
-                  projectRows,
-                  (row) =>
-                    repositoryIdentityResolver
-                      .resolve(row.workspaceRoot)
-                      .pipe(Effect.map((identity) => [row.projectId, identity] as const)),
-                  { concurrency: repositoryIdentityResolutionConcurrency },
-                ),
+              const repositoryIdentities = yield* resolveRepositoryIdentitiesForProjects(
+                projectRows,
+                { includeDeleted: true },
               );
 
               const projects: ReadonlyArray<OrchestrationProject> = projectRows.map((row) => ({
@@ -1199,16 +1224,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               updatedAt = maxIso(updatedAt, row.updatedAt);
             }
 
-            const repositoryIdentities = new Map(
-              yield* Effect.forEach(
-                projectRows,
-                (row) =>
-                  repositoryIdentityResolver
-                    .resolve(row.workspaceRoot)
-                    .pipe(Effect.map((identity) => [row.projectId, identity] as const)),
-                { concurrency: repositoryIdentityResolutionConcurrency },
-              ),
-            );
+            const repositoryIdentities = yield* resolveRepositoryIdentitiesForProjects(projectRows);
             const latestTurnByThread = new Map(
               latestTurnRows.map((row) => [row.threadId, mapLatestTurn(row)] as const),
             );

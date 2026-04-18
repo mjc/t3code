@@ -107,6 +107,7 @@ let needsProviderInvalidation = false;
 // - Capacity eviction only targets idle cached subscriptions.
 const THREAD_DETAIL_SUBSCRIPTION_IDLE_EVICTION_MS = 15 * 60 * 1000;
 const MAX_CACHED_THREAD_DETAIL_SUBSCRIPTIONS = 32;
+const INITIAL_SERVER_CONFIG_SNAPSHOT_WAIT_MS = 150;
 const NOOP = () => undefined;
 
 function compareAppliedProjectionVersion(
@@ -200,7 +201,66 @@ function markAppliedProjectionEvent(environmentId: EnvironmentId, sequence: numb
     updatedAt: currentVersion?.updatedAt ?? null,
   });
 }
+function createDeferredPromise<T>() {
+  let resolve: ((value: T) => void) | null = null;
+  const promise = new Promise<T>((nextResolve) => {
+    resolve = nextResolve;
+  });
 
+  return {
+    promise,
+    resolve: (value: T) => {
+      resolve?.(value);
+      resolve = null;
+    },
+  };
+}
+
+async function waitForConfigSnapshot(
+  promise: Promise<ServerConfig>,
+  timeoutMs: number,
+): Promise<ServerConfig | null> {
+  return await new Promise<ServerConfig | null>((resolve) => {
+    const timeoutId = globalThis.setTimeout(() => resolve(null), timeoutMs);
+    promise.then(
+      (config) => {
+        clearTimeout(timeoutId);
+        resolve(config);
+      },
+      () => {
+        clearTimeout(timeoutId);
+        resolve(null);
+      },
+    );
+  });
+}
+
+function createSavedEnvironmentSyncScheduler() {
+  let activeSync: Promise<void> | null = null;
+  let queued = false;
+
+  const run = async (): Promise<void> => {
+    do {
+      queued = false;
+      await syncSavedEnvironmentConnections(listSavedEnvironmentRecords());
+    } while (queued);
+  };
+
+  return () => {
+    if (activeSync) {
+      queued = true;
+      return activeSync;
+    }
+
+    activeSync = run()
+      .catch(() => undefined)
+      .finally(() => {
+        activeSync = null;
+      });
+
+    return activeSync;
+  };
+}
 function getThreadDetailSubscriptionKey(environmentId: EnvironmentId, threadId: ThreadId): string {
   return scopedThreadKey(scopeThreadRef(environmentId, threadId));
 }
@@ -933,6 +993,7 @@ async function ensureSavedEnvironmentConnection(
   }
 
   const client = options?.client ?? createSavedEnvironmentClient(record, bearerToken);
+  const initialConfigSnapshot = createDeferredPromise<ServerConfig>();
   const knownEnvironment = createKnownEnvironment({
     id: record.environmentId,
     label: record.label,
@@ -953,6 +1014,7 @@ async function ensureSavedEnvironmentConnection(
       await refreshSavedEnvironmentMetadata(record, bearerToken, client);
     },
     onConfigSnapshot: (config) => {
+      initialConfigSnapshot.resolve(config);
       useSavedEnvironmentRuntimeStore.getState().patch(record.environmentId, {
         descriptor: config.environment,
         serverConfig: config,
@@ -969,12 +1031,18 @@ async function ensureSavedEnvironmentConnection(
   registerConnection(connection);
 
   try {
+    const initialServerConfig =
+      options?.serverConfig ??
+      (await waitForConfigSnapshot(
+        initialConfigSnapshot.promise,
+        INITIAL_SERVER_CONFIG_SNAPSHOT_WAIT_MS,
+      ));
     await refreshSavedEnvironmentMetadata(
       record,
       bearerToken,
       client,
       options?.role ?? null,
-      options?.serverConfig ?? null,
+      initialServerConfig,
     );
     return connection;
   } catch (error) {
@@ -1169,6 +1237,7 @@ export function startEnvironmentConnectionService(queryClient: QueryClient): () 
       trailing: true,
     },
   );
+  const requestSavedEnvironmentSync = createSavedEnvironmentSyncScheduler();
 
   createPrimaryEnvironmentConnection();
 
@@ -1176,11 +1245,11 @@ export function startEnvironmentConnectionService(queryClient: QueryClient): () 
     if (!hasSavedEnvironmentRegistryHydrated()) {
       return;
     }
-    void syncSavedEnvironmentConnections(listSavedEnvironmentRecords());
+    void requestSavedEnvironmentSync();
   });
 
   void waitForSavedEnvironmentRegistryHydration()
-    .then(() => syncSavedEnvironmentConnections(listSavedEnvironmentRecords()))
+    .then(() => requestSavedEnvironmentSync())
     .catch(() => undefined);
 
   activeService = {
