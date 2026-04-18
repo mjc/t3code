@@ -401,18 +401,22 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     execute: () =>
       sql`
         SELECT
-          thread_id AS "threadId",
-          turn_id AS "turnId",
-          state,
-          requested_at AS "requestedAt",
-          started_at AS "startedAt",
-          completed_at AS "completedAt",
-          assistant_message_id AS "assistantMessageId",
-          source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
-          source_proposed_plan_id AS "sourceProposedPlanId"
-        FROM projection_turns
-        WHERE turn_id IS NOT NULL
-        ORDER BY thread_id ASC, requested_at DESC, turn_id DESC
+          turns.thread_id AS "threadId",
+          turns.turn_id AS "turnId",
+          turns.state,
+          turns.requested_at AS "requestedAt",
+          turns.started_at AS "startedAt",
+          turns.completed_at AS "completedAt",
+          turns.assistant_message_id AS "assistantMessageId",
+          turns.source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
+          turns.source_proposed_plan_id AS "sourceProposedPlanId"
+        FROM projection_threads threads
+        JOIN projection_turns turns
+          ON turns.thread_id = threads.thread_id
+          AND turns.turn_id = threads.latest_turn_id
+        WHERE threads.deleted_at IS NULL
+          AND threads.latest_turn_id IS NOT NULL
+        ORDER BY turns.thread_id ASC
       `,
   });
 
@@ -1023,10 +1027,26 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       .pipe(
         Effect.flatMap(
           ([projectRows, threadRows, proposedPlanRows, sessionRows, latestTurnRows, stateRows]) =>
-            Effect.gen(function* () {
+            Effect.sync(() => {
               let updatedAt: string | null = null;
+              const projects: OrchestrationProject[] = [];
+              const threads: OrchestrationThread[] = [];
+
               for (const row of projectRows) {
                 updatedAt = maxIso(updatedAt, row.updatedAt);
+                if (row.deletedAt !== null) {
+                  continue;
+                }
+                projects.push({
+                  id: row.projectId,
+                  title: row.title,
+                  workspaceRoot: row.workspaceRoot,
+                  defaultModelSelection: row.defaultModelSelection,
+                  scripts: row.scripts,
+                  createdAt: row.createdAt,
+                  updatedAt: row.updatedAt,
+                  deletedAt: null,
+                });
               }
               for (const row of threadRows) {
                 updatedAt = maxIso(updatedAt, row.updatedAt);
@@ -1050,9 +1070,10 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 updatedAt = maxIso(updatedAt, row.updatedAt);
               }
 
-              const latestTurnByThread = new Map(
-                latestTurnRows.map((row) => [row.threadId, mapLatestTurn(row)] as const),
-              );
+              const latestTurnByThread = new Map<string, OrchestrationLatestTurn>();
+              for (const row of latestTurnRows) {
+                latestTurnByThread.set(row.threadId, mapLatestTurn(row));
+              }
               const proposedPlansByThread = new Map<string, Array<OrchestrationProposedPlan>>();
               const sessionByThread = new Map(
                 sessionRows.map((row) => [row.threadId, mapSessionRow(row)] as const),
@@ -1064,54 +1085,38 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 proposedPlansByThread.set(row.threadId, threadProposedPlans);
               }
 
-              return yield* decodeReadModel({
+              for (const row of threadRows) {
+                if (row.deletedAt !== null) {
+                  continue;
+                }
+                threads.push({
+                  id: row.threadId,
+                  projectId: row.projectId,
+                  title: row.title,
+                  modelSelection: row.modelSelection,
+                  runtimeMode: row.runtimeMode,
+                  interactionMode: row.interactionMode,
+                  branch: row.branch,
+                  worktreePath: row.worktreePath,
+                  latestTurn: latestTurnByThread.get(row.threadId) ?? null,
+                  createdAt: row.createdAt,
+                  updatedAt: row.updatedAt,
+                  archivedAt: row.archivedAt,
+                  deletedAt: null,
+                  messages: [],
+                  proposedPlans: proposedPlansByThread.get(row.threadId) ?? [],
+                  activities: [],
+                  checkpoints: [],
+                  session: sessionByThread.get(row.threadId) ?? null,
+                });
+              }
+
+              return {
                 snapshotSequence: computeSnapshotSequence(stateRows),
-                projects: projectRows
-                  .filter((row) => row.deletedAt === null)
-                  .map(
-                    (row): OrchestrationProject => ({
-                      id: row.projectId,
-                      title: row.title,
-                      workspaceRoot: row.workspaceRoot,
-                      defaultModelSelection: row.defaultModelSelection,
-                      scripts: row.scripts,
-                      createdAt: row.createdAt,
-                      updatedAt: row.updatedAt,
-                      deletedAt: null,
-                    }),
-                  ),
-                threads: threadRows
-                  .filter((row) => row.deletedAt === null)
-                  .map(
-                    (row): OrchestrationThread => ({
-                      id: row.threadId,
-                      projectId: row.projectId,
-                      title: row.title,
-                      modelSelection: row.modelSelection,
-                      runtimeMode: row.runtimeMode,
-                      interactionMode: row.interactionMode,
-                      branch: row.branch,
-                      worktreePath: row.worktreePath,
-                      latestTurn: latestTurnByThread.get(row.threadId) ?? null,
-                      createdAt: row.createdAt,
-                      updatedAt: row.updatedAt,
-                      archivedAt: row.archivedAt,
-                      deletedAt: null,
-                      messages: [],
-                      proposedPlans: proposedPlansByThread.get(row.threadId) ?? [],
-                      activities: [],
-                      checkpoints: [],
-                      session: sessionByThread.get(row.threadId) ?? null,
-                    }),
-                  ),
+                projects,
+                threads,
                 updatedAt: updatedAt ?? new Date(0).toISOString(),
-              }).pipe(
-                Effect.mapError(
-                  toPersistenceDecodeError(
-                    "ProjectionSnapshotQuery.getCommandReadModel:decodeReadModel",
-                  ),
-                ),
-              );
+              } satisfies OrchestrationReadModel;
             }),
         ),
         Effect.mapError((error) => {
