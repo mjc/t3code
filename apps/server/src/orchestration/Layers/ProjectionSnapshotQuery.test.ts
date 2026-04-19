@@ -1174,6 +1174,91 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       assert.equal(fullSnapshot.threads[0]?.latestTurn?.state, "running");
     }),
   );
+
+  it.effect("keeps deleted project and thread tombstones in the command read model", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+
+      yield* sql`DELETE FROM projection_projects`;
+      yield* sql`DELETE FROM projection_threads`;
+      yield* sql`DELETE FROM projection_state`;
+
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id,
+          title,
+          workspace_root,
+          default_model_selection_json,
+          scripts_json,
+          created_at,
+          updated_at,
+          deleted_at
+        )
+        VALUES (
+          'project-deleted',
+          'Deleted Project',
+          '/tmp/deleted-project',
+          '{"provider":"codex","model":"gpt-5-codex"}',
+          '[]',
+          '2026-04-05T00:00:00.000Z',
+          '2026-04-05T00:00:01.000Z',
+          '2026-04-05T00:00:02.000Z'
+        )
+      `;
+
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id,
+          project_id,
+          title,
+          model_selection_json,
+          runtime_mode,
+          interaction_mode,
+          branch,
+          worktree_path,
+          latest_turn_id,
+          latest_user_message_at,
+          pending_approval_count,
+          pending_user_input_count,
+          has_actionable_proposed_plan,
+          created_at,
+          updated_at,
+          archived_at,
+          deleted_at
+        )
+        VALUES (
+          'thread-deleted',
+          'project-deleted',
+          'Deleted Thread',
+          '{"provider":"codex","model":"gpt-5-codex"}',
+          'full-access',
+          'default',
+          NULL,
+          NULL,
+          NULL,
+          NULL,
+          0,
+          0,
+          0,
+          '2026-04-05T00:00:03.000Z',
+          '2026-04-05T00:00:04.000Z',
+          NULL,
+          '2026-04-05T00:00:05.000Z'
+        )
+      `;
+
+      const commandReadModel = yield* snapshotQuery.getCommandReadModel();
+      assert.equal(commandReadModel.projects[0]?.id, asProjectId("project-deleted"));
+      assert.equal(commandReadModel.projects[0]?.deletedAt, "2026-04-05T00:00:02.000Z");
+      assert.equal(commandReadModel.threads[0]?.id, ThreadId.make("thread-deleted"));
+      assert.equal(commandReadModel.threads[0]?.deletedAt, "2026-04-05T00:00:05.000Z");
+
+      const shellSnapshot = yield* snapshotQuery.getShellSnapshot();
+      assert.equal(shellSnapshot.projects.length, 0);
+      assert.equal(shellSnapshot.threads.length, 0);
+    }),
+  );
 });
 
 it.effect(
