@@ -1057,11 +1057,12 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               const projects: OrchestrationProject[] = [];
               const threads: OrchestrationThread[] = [];
 
-              for (const row of projectRows) {
-                updatedAt = maxIso(updatedAt, row.updatedAt);
-                if (row.deletedAt !== null) {
+              for (let index = 0; index < projectRows.length; index += 1) {
+                const row = projectRows[index];
+                if (!row) {
                   continue;
                 }
+                updatedAt = maxIso(updatedAt, row.updatedAt);
                 projects.push({
                   id: row.projectId,
                   title: row.title,
@@ -1070,19 +1071,35 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   scripts: row.scripts,
                   createdAt: row.createdAt,
                   updatedAt: row.updatedAt,
-                  deletedAt: null,
+                  deletedAt: row.deletedAt,
                 });
               }
-              for (const row of threadRows) {
+              for (let index = 0; index < threadRows.length; index += 1) {
+                const row = threadRows[index];
+                if (!row) {
+                  continue;
+                }
                 updatedAt = maxIso(updatedAt, row.updatedAt);
               }
-              for (const row of proposedPlanRows) {
+              for (let index = 0; index < proposedPlanRows.length; index += 1) {
+                const row = proposedPlanRows[index];
+                if (!row) {
+                  continue;
+                }
                 updatedAt = maxIso(updatedAt, row.updatedAt);
               }
-              for (const row of sessionRows) {
+              for (let index = 0; index < sessionRows.length; index += 1) {
+                const row = sessionRows[index];
+                if (!row) {
+                  continue;
+                }
                 updatedAt = maxIso(updatedAt, row.updatedAt);
               }
-              for (const row of latestTurnRows) {
+              for (let index = 0; index < latestTurnRows.length; index += 1) {
+                const row = latestTurnRows[index];
+                if (!row) {
+                  continue;
+                }
                 updatedAt = maxIso(updatedAt, row.requestedAt);
                 if (row.startedAt !== null) {
                   updatedAt = maxIso(updatedAt, row.startedAt);
@@ -1091,27 +1108,46 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   updatedAt = maxIso(updatedAt, row.completedAt);
                 }
               }
-              for (const row of stateRows) {
+              for (let index = 0; index < stateRows.length; index += 1) {
+                const row = stateRows[index];
+                if (!row) {
+                  continue;
+                }
                 updatedAt = maxIso(updatedAt, row.updatedAt);
               }
 
               const latestTurnByThread = new Map<string, OrchestrationLatestTurn>();
-              for (const row of latestTurnRows) {
+              for (let index = 0; index < latestTurnRows.length; index += 1) {
+                const row = latestTurnRows[index];
+                if (!row) {
+                  continue;
+                }
                 latestTurnByThread.set(row.threadId, mapLatestTurn(row));
               }
               const proposedPlansByThread = new Map<string, Array<OrchestrationProposedPlan>>();
-              const sessionByThread = new Map(
-                sessionRows.map((row) => [row.threadId, mapSessionRow(row)] as const),
-              );
+              const sessionByThread = new Map<string, OrchestrationSession>();
 
-              for (const row of proposedPlanRows) {
+              for (let index = 0; index < sessionRows.length; index += 1) {
+                const row = sessionRows[index];
+                if (!row) {
+                  continue;
+                }
+                sessionByThread.set(row.threadId, mapSessionRow(row));
+              }
+
+              for (let index = 0; index < proposedPlanRows.length; index += 1) {
+                const row = proposedPlanRows[index];
+                if (!row) {
+                  continue;
+                }
                 const threadProposedPlans = proposedPlansByThread.get(row.threadId) ?? [];
                 threadProposedPlans.push(mapProposedPlanRow(row));
                 proposedPlansByThread.set(row.threadId, threadProposedPlans);
               }
 
-              for (const row of threadRows) {
-                if (row.deletedAt !== null) {
+              for (let index = 0; index < threadRows.length; index += 1) {
+                const row = threadRows[index];
+                if (!row) {
                   continue;
                 }
                 threads.push({
@@ -1127,7 +1163,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   createdAt: row.createdAt,
                   updatedAt: row.updatedAt,
                   archivedAt: row.archivedAt,
-                  deletedAt: null,
+                  deletedAt: row.deletedAt,
                   messages: [],
                   proposedPlans: proposedPlansByThread.get(row.threadId) ?? [],
                   activities: [],
