@@ -1182,6 +1182,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
 
       yield* sql`DELETE FROM projection_projects`;
       yield* sql`DELETE FROM projection_threads`;
+      yield* sql`DELETE FROM projection_turns`;
       yield* sql`DELETE FROM projection_state`;
 
       yield* sql`
@@ -1236,7 +1237,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           'default',
           NULL,
           NULL,
-          NULL,
+          'turn-deleted',
           NULL,
           0,
           0,
@@ -1248,11 +1249,53 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
         )
       `;
 
+      yield* sql`
+        INSERT INTO projection_turns (
+          thread_id,
+          turn_id,
+          pending_message_id,
+          source_proposed_plan_thread_id,
+          source_proposed_plan_id,
+          assistant_message_id,
+          state,
+          requested_at,
+          started_at,
+          completed_at,
+          checkpoint_turn_count,
+          checkpoint_ref,
+          checkpoint_status,
+          checkpoint_files_json
+        )
+        VALUES (
+          'thread-deleted',
+          'turn-deleted',
+          'message-deleted-user',
+          NULL,
+          NULL,
+          'message-deleted-assistant',
+          'completed',
+          '2026-04-05T00:00:04.100Z',
+          '2026-04-05T00:00:04.200Z',
+          '2026-04-05T00:00:04.300Z',
+          NULL,
+          NULL,
+          NULL,
+          '[]'
+        )
+      `;
+
       const commandReadModel = yield* snapshotQuery.getCommandReadModel();
       assert.equal(commandReadModel.projects[0]?.id, asProjectId("project-deleted"));
       assert.equal(commandReadModel.projects[0]?.deletedAt, "2026-04-05T00:00:02.000Z");
       assert.equal(commandReadModel.threads[0]?.id, ThreadId.make("thread-deleted"));
       assert.equal(commandReadModel.threads[0]?.deletedAt, "2026-04-05T00:00:05.000Z");
+      assert.equal(commandReadModel.threads[0]?.latestTurn?.turnId, asTurnId("turn-deleted"));
+      assert.equal(commandReadModel.threads[0]?.latestTurn?.state, "completed");
+
+      const fullSnapshot = yield* snapshotQuery.getSnapshot();
+      assert.equal(fullSnapshot.threads[0]?.id, ThreadId.make("thread-deleted"));
+      assert.equal(fullSnapshot.threads[0]?.latestTurn?.turnId, asTurnId("turn-deleted"));
+      assert.equal(fullSnapshot.threads[0]?.latestTurn?.state, "completed");
 
       const shellSnapshot = yield* snapshotQuery.getShellSnapshot();
       assert.equal(shellSnapshot.projects.length, 0);

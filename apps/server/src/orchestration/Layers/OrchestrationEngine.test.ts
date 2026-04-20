@@ -7,6 +7,7 @@ import {
   ThreadId,
   TurnId,
   type OrchestrationEvent,
+  type OrchestrationReadModel,
 } from "@t3tools/contracts";
 import { Effect, Layer, ManagedRuntime, Metric, Option, Queue, Stream } from "effect";
 import { describe, expect, it } from "vitest";
@@ -62,6 +63,14 @@ async function createOrchestrationSystem() {
 
 function now() {
   return new Date().toISOString();
+}
+
+function makePromiseGate<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
 }
 
 const hasMetricSnapshot = (
@@ -263,6 +272,164 @@ describe("OrchestrationEngine", () => {
     const readModelB = await system.run(engine.getReadModel());
     expect(readModelB).toEqual(readModelA);
     await system.dispose();
+  });
+
+  it("does not publish full read model until hydration catches up", async () => {
+    const baseReadModel: OrchestrationReadModel = {
+      snapshotSequence: 1,
+      updatedAt: "2026-04-06T00:00:00.000Z",
+      projects: [
+        {
+          id: asProjectId("project-hydration-race"),
+          title: "Hydration Race Project",
+          workspaceRoot: "/tmp/project-hydration-race",
+          defaultModelSelection: {
+            provider: "codex",
+            model: "gpt-5-codex",
+          },
+          scripts: [],
+          createdAt: "2026-04-06T00:00:00.000Z",
+          updatedAt: "2026-04-06T00:00:00.000Z",
+          deletedAt: null,
+        },
+      ],
+      threads: [
+        {
+          id: ThreadId.make("thread-hydration-race"),
+          projectId: asProjectId("project-hydration-race"),
+          title: "before-hydration",
+          modelSelection: {
+            provider: "codex",
+            model: "gpt-5-codex",
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          branch: null,
+          worktreePath: null,
+          latestTurn: null,
+          createdAt: "2026-04-06T00:00:00.000Z",
+          updatedAt: "2026-04-06T00:00:00.000Z",
+          archivedAt: null,
+          deletedAt: null,
+          messages: [],
+          proposedPlans: [],
+          activities: [],
+          checkpoints: [],
+          session: null,
+        },
+      ],
+    };
+
+    const events: OrchestrationEvent[] = [];
+    let nextSequence = 2;
+    const firstReadStarted = makePromiseGate();
+    const firstReadRelease = makePromiseGate();
+    const secondReadStarted = makePromiseGate();
+    const secondReadRelease = makePromiseGate();
+    let readCallCount = 0;
+
+    const eventStore: OrchestrationEventStoreShape = {
+      append: (event) =>
+        Effect.sync(() => {
+          const savedEvent = {
+            ...event,
+            sequence: nextSequence,
+          } as OrchestrationEvent;
+          nextSequence += 1;
+          events.push(savedEvent);
+          return savedEvent;
+        }),
+      readFromSequence: (sequenceExclusive) => {
+        readCallCount += 1;
+        const readCallIndex = readCallCount;
+        const capturedEvents = events.filter((event) => event.sequence > sequenceExclusive);
+
+        if (readCallIndex === 1) {
+          firstReadStarted.resolve();
+          return Stream.fromEffect(Effect.promise(() => firstReadRelease.promise)).pipe(
+            Stream.flatMap(() => Stream.fromIterable(capturedEvents)),
+          );
+        }
+
+        if (readCallIndex === 2) {
+          secondReadStarted.resolve();
+          return Stream.fromEffect(Effect.promise(() => secondReadRelease.promise)).pipe(
+            Stream.flatMap(() => Stream.fromIterable(capturedEvents)),
+          );
+        }
+
+        return Stream.fromIterable(capturedEvents);
+      },
+      readAll: () => Stream.fromIterable(events),
+    };
+
+    const runtime = ManagedRuntime.make(
+      OrchestrationEngineLive.pipe(
+        Layer.provide(
+          Layer.succeed(ProjectionSnapshotQuery, {
+            getCommandReadModel: () => Effect.succeed(baseReadModel),
+            getSnapshot: () => Effect.succeed(baseReadModel),
+            getShellSnapshot: () =>
+              Effect.succeed({
+                snapshotSequence: baseReadModel.snapshotSequence,
+                projects: [],
+                threads: [],
+                updatedAt: baseReadModel.updatedAt,
+              }),
+            getSnapshotSequence: () =>
+              Effect.succeed({ snapshotSequence: baseReadModel.snapshotSequence }),
+            getCounts: () => Effect.succeed({ projectCount: 1, threadCount: 1 }),
+            getActiveProjectByWorkspaceRoot: () => Effect.succeed(Option.none()),
+            getProjectShellById: () => Effect.succeed(Option.none()),
+            getFirstActiveThreadIdByProjectId: () => Effect.succeed(Option.none()),
+            getThreadCheckpointContext: () => Effect.succeed(Option.none()),
+            getThreadShellById: () => Effect.succeed(Option.none()),
+            getThreadDetailById: () => Effect.succeed(Option.none()),
+          }),
+        ),
+        Layer.provide(
+          Layer.succeed(OrchestrationProjectionPipeline, {
+            bootstrap: Effect.void,
+            projectEvent: () => Effect.void,
+          } satisfies OrchestrationProjectionPipelineShape),
+        ),
+        Layer.provide(Layer.succeed(OrchestrationEventStore, eventStore)),
+        Layer.provide(OrchestrationCommandReceiptRepositoryLive),
+        Layer.provide(SqlitePersistenceMemory),
+      ),
+    );
+    const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
+
+    const readModelPromise = runtime.runPromise(engine.getReadModel());
+    await firstReadStarted.promise;
+
+    await runtime.runPromise(
+      engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-hydration-race-1"),
+        threadId: ThreadId.make("thread-hydration-race"),
+        title: "after-first-dispatch",
+      }),
+    );
+
+    firstReadRelease.resolve();
+    await secondReadStarted.promise;
+
+    await runtime.runPromise(
+      engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-hydration-race-2"),
+        threadId: ThreadId.make("thread-hydration-race"),
+        title: "after-second-dispatch",
+      }),
+    );
+
+    secondReadRelease.resolve();
+    const readModel = await readModelPromise;
+    expect(readModel.snapshotSequence).toBe(3);
+    expect(readModel.threads[0]?.title).toBe("after-second-dispatch");
+
+    await runtime.dispose();
   });
 
   it("archives and unarchives threads through orchestration commands", async () => {
