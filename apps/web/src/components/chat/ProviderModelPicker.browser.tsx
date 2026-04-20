@@ -407,7 +407,7 @@ describe("ProviderModelPicker", () => {
         expect(getSidebarProviderOrder()).not.toContain("github-copilot-coming-soon");
       });
 
-      await page.getByRole("button", { name: "Copilot", exact: true }).click();
+      await page.getByRole("button", { name: "GitHub Copilot", exact: true }).click();
 
       await vi.waitFor(() => {
         const listText = getModelPickerListText();

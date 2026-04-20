@@ -127,7 +127,7 @@ const PROVIDER_SETTINGS: readonly InstallProviderSettings[] = [
   },
   {
     provider: "copilot",
-    title: "Copilot",
+    title: "GitHub Copilot",
     binaryPlaceholder: "Bundled Copilot CLI",
     binaryDescription:
       "Optional path to a GitHub Copilot CLI binary. Leave blank to use the SDK-bundled CLI.",
