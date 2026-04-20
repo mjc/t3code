@@ -1,10 +1,10 @@
 import { type ProviderKind, PROVIDER_DISPLAY_NAMES } from "@t3tools/contracts";
-import { ClaudeAI, CursorIcon, GitHubIcon, Icon, OpenAI, OpenCodeIcon } from "../Icons";
+import { ClaudeAI, CursorIcon, GithubCopilotIcon, Icon, OpenAI, OpenCodeIcon } from "../Icons";
 import { PROVIDER_OPTIONS } from "../../session-logic";
 
 export const PROVIDER_ICON_BY_PROVIDER: Record<ProviderKind, Icon> = {
   codex: OpenAI,
-  copilot: GitHubIcon,
+  copilot: GithubCopilotIcon,
   claudeAgent: ClaudeAI,
   opencode: OpenCodeIcon,
   cursor: CursorIcon,
