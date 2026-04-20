@@ -30,9 +30,49 @@ const COPILOT_REASONING_LABELS = {
   xhigh: "Extra High",
 } as const;
 
+const GENERIC_EFFECT_TRY_PROMISE_MESSAGES = new Set([
+  "An error occurred in Effect.tryPromise",
+  "An error occurred in Effect.try",
+]);
+const COPILOT_CLI_PATH_ENV = "COPILOT_CLI_PATH";
+
+export class CopilotProbePromiseError extends Error {
+  override readonly cause: unknown;
+
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.cause = cause;
+    this.name = "CopilotProbePromiseError";
+  }
+}
+
 function trimOrUndefined(value: string | null | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
+}
+
+export function toCopilotProbeError(cause: unknown): CopilotProbePromiseError {
+  return new CopilotProbePromiseError(cause);
+}
+
+function describeCopilotProbeCause(cause: unknown): string {
+  const seen = new Set<unknown>();
+  let current: unknown = cause;
+
+  while (current instanceof Error && !seen.has(current)) {
+    seen.add(current);
+    const message = current.message.trim();
+    if (message.length > 0 && !GENERIC_EFFECT_TRY_PROMISE_MESSAGES.has(message)) {
+      return message;
+    }
+    current = current.cause;
+  }
+
+  if (typeof current === "string") {
+    return current.trim();
+  }
+
+  return "";
 }
 
 function authTypeLabel(authType: GetAuthStatusResponse["authType"]): string | undefined {
@@ -61,17 +101,34 @@ export function createCopilotClient(input: {
   readonly logLevel?: CopilotClientOptions["logLevel"];
   readonly onListModels?: CopilotClientOptions["onListModels"];
 }) {
+  return new CopilotClient(buildCopilotClientOptions(input));
+}
+
+export function buildCopilotClientOptions(input: {
+  readonly settings: CopilotSettings;
+  readonly cwd?: string;
+  readonly env?: Record<string, string | undefined>;
+  readonly logLevel?: CopilotClientOptions["logLevel"];
+  readonly onListModels?: CopilotClientOptions["onListModels"];
+}): CopilotClientOptions {
   const cliPath = trimOrUndefined(input.settings.binaryPath);
   const cliUrl = trimOrUndefined(input.settings.serverUrl);
+  const env = { ...process.env };
 
-  return new CopilotClient({
+  if (input.env) {
+    Object.assign(env, input.env);
+  }
+
+  delete env[COPILOT_CLI_PATH_ENV];
+
+  return {
     ...(cliUrl ? { cliUrl } : {}),
     ...(!cliUrl && cliPath ? { cliPath } : {}),
     ...(input.cwd ? { cwd: input.cwd } : {}),
-    ...(input.env ? { env: input.env } : {}),
+    env,
     ...(input.logLevel ? { logLevel: input.logLevel } : {}),
     ...(input.onListModels ? { onListModels: input.onListModels } : {}),
-  });
+  };
 }
 
 export function versionFromCopilotStatus(status: GetStatusResponse): string | null {
@@ -161,8 +218,7 @@ export function formatCopilotProbeError(input: {
   readonly installed: boolean;
   readonly message: string;
 } {
-  const message =
-    input.cause instanceof Error ? input.cause.message.trim() : String(input.cause ?? "");
+  const message = describeCopilotProbeCause(input.cause);
   const lower = message.toLowerCase();
   const cliUrl = trimOrUndefined(input.settings.serverUrl);
   const cliPath = trimOrUndefined(input.settings.binaryPath);

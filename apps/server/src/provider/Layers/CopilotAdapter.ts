@@ -1,6 +1,3 @@
-import { randomUUID } from "node:crypto";
-import * as nodePath from "node:path";
-
 import type {
   CopilotClient,
   CopilotSession,
@@ -25,8 +22,8 @@ import {
   TurnId,
   type UserInputQuestion,
 } from "@t3tools/contracts";
-import { Effect, Layer, PubSub, Schema, Stream } from "effect";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
+import { Deferred, Effect, Layer, Path, Predicate, PubSub, Random, Schema, Stream } from "effect";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
@@ -66,13 +63,6 @@ const getCopilotReasoningEffort = (
   const reasoningEffort = getModelSelectionStringOptionValue(modelSelection, "reasoningEffort");
   return reasoningEffort ? (reasoningEffort as CopilotReasoningEffort) : undefined;
 };
-
-interface PromiseKit<T> {
-  readonly promise: Promise<T>;
-  resolve: (value: T) => void;
-  reject: (error: unknown) => void;
-}
-
 interface CopilotTurnSnapshot {
   readonly id: TurnId;
   readonly items: Array<unknown>;
@@ -80,12 +70,12 @@ interface CopilotTurnSnapshot {
 
 interface PendingPermissionHandler {
   readonly signature: string;
-  readonly promiseKit: PromiseKit<PermissionRequestResult>;
+  readonly deferred: Deferred.Deferred<PermissionRequestResult>;
 }
 
 interface PendingUserInputHandler {
   readonly signature: string;
-  readonly promiseKit: PromiseKit<CopilotUserInputResponse>;
+  readonly deferred: Deferred.Deferred<CopilotUserInputResponse>;
 }
 
 interface PendingPermissionBinding {
@@ -94,7 +84,7 @@ interface PendingPermissionBinding {
     | "command_execution_approval"
     | "file_read_approval"
     | "file_change_approval";
-  readonly promiseKit: PromiseKit<PermissionRequestResult>;
+  readonly deferred: Deferred.Deferred<PermissionRequestResult>;
 }
 
 interface PendingUserInputBinding {
@@ -102,7 +92,7 @@ interface PendingUserInputBinding {
   readonly question: string;
   readonly choices: ReadonlyArray<string>;
   readonly allowFreeform: boolean;
-  readonly promiseKit: PromiseKit<CopilotUserInputResponse>;
+  readonly deferred: Deferred.Deferred<CopilotUserInputResponse>;
 }
 
 interface ToolMeta {
@@ -154,29 +144,21 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function createPromiseKit<T>(): PromiseKit<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (error: unknown) => void;
-  const promise = new Promise<T>((promiseResolve, promiseReject) => {
-    resolve = promiseResolve;
-    reject = promiseReject;
-  });
-  return { promise, resolve, reject };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function trimToUndefined(value: string | null | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
 }
 
 function parseCopilotResumeCursor(raw: unknown): { sessionId: string } | undefined {
-  if (!isRecord(raw)) return undefined;
-  if (raw.schemaVersion !== COPILOT_RESUME_SCHEMA_VERSION) return undefined;
-  if (typeof raw.sessionId !== "string") return undefined;
+  if (
+    !Predicate.hasProperty(raw, "schemaVersion") ||
+    raw.schemaVersion !== COPILOT_RESUME_SCHEMA_VERSION
+  ) {
+    return undefined;
+  }
+  if (!Predicate.hasProperty(raw, "sessionId") || !Predicate.isString(raw.sessionId)) {
+    return undefined;
+  }
   const sessionId = raw.sessionId.trim();
   return sessionId.length > 0 ? { sessionId } : undefined;
 }
@@ -197,7 +179,7 @@ function createBaseEvent(input: {
   readonly raw?: SessionEvent | undefined;
 }) {
   return {
-    eventId: EventId.make(randomUUID()),
+    eventId: EventId.make(Effect.runSync(Random.nextUUIDv4)),
     provider: PROVIDER,
     threadId: input.threadId,
     createdAt: input.createdAt ?? nowIso(),
@@ -235,19 +217,6 @@ function appendTurnItem(
     return;
   }
   ensureTurnSnapshot(context, turnId).items.push(item);
-}
-
-function requestError(
-  method: string,
-  detail: string,
-  cause?: unknown,
-): ProviderAdapterRequestError {
-  return new ProviderAdapterRequestError({
-    provider: PROVIDER,
-    method,
-    detail,
-    ...(cause !== undefined ? { cause } : {}),
-  });
 }
 
 function processError(
@@ -575,38 +544,50 @@ function answerFromUserInput(
   };
 }
 
-function settlePendingPermissionHandlers(context: CopilotSessionContext): void {
+async function settlePendingPermissionHandlers(context: CopilotSessionContext): Promise<void> {
   for (const handlers of context.pendingPermissionHandlersBySignature.values()) {
     for (const handler of handlers) {
-      handler.promiseKit.resolve({ kind: "denied-interactively-by-user" });
+      await Effect.runPromise(
+        Deferred.succeed(handler.deferred, { kind: "denied-interactively-by-user" }).pipe(
+          Effect.ignore,
+        ),
+      );
     }
   }
   context.pendingPermissionHandlersBySignature.clear();
   context.pendingPermissionEventsBySignature.clear();
 
   for (const binding of context.pendingPermissionBindings.values()) {
-    binding.promiseKit.resolve({ kind: "denied-interactively-by-user" });
+    await Effect.runPromise(
+      Deferred.succeed(binding.deferred, { kind: "denied-interactively-by-user" }).pipe(
+        Effect.ignore,
+      ),
+    );
   }
   context.pendingPermissionBindings.clear();
 }
 
-function settlePendingUserInputs(context: CopilotSessionContext): void {
+async function settlePendingUserInputs(context: CopilotSessionContext): Promise<void> {
   for (const handlers of context.pendingUserInputHandlersBySignature.values()) {
     for (const handler of handlers) {
-      handler.promiseKit.resolve({
-        answer: "",
-        wasFreeform: true,
-      });
+      await Effect.runPromise(
+        Deferred.succeed(handler.deferred, {
+          answer: "",
+          wasFreeform: true,
+        }).pipe(Effect.ignore),
+      );
     }
   }
   context.pendingUserInputHandlersBySignature.clear();
   context.pendingUserInputEventsBySignature.clear();
 
   for (const binding of context.pendingUserInputBindings.values()) {
-    binding.promiseKit.resolve({
-      answer: "",
-      wasFreeform: true,
-    });
+    await Effect.runPromise(
+      Deferred.succeed(binding.deferred, {
+        answer: "",
+        wasFreeform: true,
+      }).pipe(Effect.ignore),
+    );
   }
   context.pendingUserInputBindings.clear();
 }
@@ -624,7 +605,7 @@ function resolveTurnIdForSdkTurn(context: CopilotSessionContext, sdkTurnId: stri
     context.queuedTurnIds.shift() ??
     context.activeTurnId ??
     latestTurnId(context) ??
-    TurnId.make(`copilot-turn-${randomUUID()}`);
+    TurnId.make(`copilot-turn-${Effect.runSync(Random.nextUUIDv4)}`);
   context.sdkTurnIdsToTurnIds.set(sdkTurnId, nextTurnId);
   ensureTurnSnapshot(context, nextTurnId);
   context.activeSdkTurnId = sdkTurnId;
@@ -680,8 +661,10 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
       const managedNativeEventLogger =
         options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
       const sessions = new Map<ThreadId, CopilotSessionContext>();
+      const path = yield* Path.Path;
       const runtimeContext = yield* Effect.context();
       const runWithContext = Effect.runPromiseWith(runtimeContext);
+      const runSyncWithContext = Effect.runSyncWith(runtimeContext);
 
       const emit = (event: ProviderRuntimeEvent) =>
         PubSub.publish(runtimeEventPubSub, event).pipe(Effect.asVoid);
@@ -892,7 +875,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           context.pendingPermissionBindings.set(requestId, {
             requestId,
             requestType: mapPermissionRequestType(eventData.permissionRequest),
-            promiseKit: handler.promiseKit,
+            deferred: handler.deferred,
           });
           if (
             context.session.runtimeMode === "approval-required" &&
@@ -933,7 +916,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             question: eventData.question.trim(),
             choices: eventData.choices?.map((choice) => choice.trim()).filter(Boolean) ?? [],
             allowFreeform: eventData.allowFreeform ?? true,
-            promiseKit: handler.promiseKit,
+            deferred: handler.deferred,
           };
           context.pendingUserInputBindings.set(requestId, binding);
           await emitUserInputRequested(context, requestId, binding, {
@@ -966,15 +949,15 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
         }
 
         const signature = permissionSignature(request as PermissionRequest & { kind: string });
-        const promiseKit = createPromiseKit<PermissionRequestResult>();
+        const deferred = runSyncWithContext(Deferred.make<PermissionRequestResult>());
         const queue = context.pendingPermissionHandlersBySignature.get(signature) ?? [];
         queue.push({
           signature,
-          promiseKit,
+          deferred,
         });
         context.pendingPermissionHandlersBySignature.set(signature, queue);
         await bindPermissionRequests(context, signature);
-        return promiseKit.promise;
+        return runWithContext(Deferred.await(deferred));
       };
 
       const onUserInputRequest = async (
@@ -989,15 +972,15 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
         }
 
         const signature = userInputSignature(request);
-        const promiseKit = createPromiseKit<CopilotUserInputResponse>();
+        const deferred = runSyncWithContext(Deferred.make<CopilotUserInputResponse>());
         const queue = context.pendingUserInputHandlersBySignature.get(signature) ?? [];
         queue.push({
           signature,
-          promiseKit,
+          deferred,
         });
         context.pendingUserInputHandlersBySignature.set(signature, queue);
         await bindUserInputRequests(context, signature);
-        return promiseKit.promise;
+        return runWithContext(Deferred.await(deferred));
       };
 
       const syncSessionMode = async (
@@ -1793,7 +1776,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             );
           }
 
-          const cwd = nodePath.resolve(input.cwd ?? serverConfig.cwd);
+          const cwd = path.resolve(input.cwd ?? serverConfig.cwd);
           const modelSelection =
             input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
           const reasoningEffort = getCopilotReasoningEffort(modelSelection);
@@ -1932,13 +1915,15 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
                 }),
               ),
             catch: (cause) =>
-              requestError(
-                "session.mode.set",
-                cause instanceof Error
-                  ? cause.message
-                  : "Failed to synchronize Copilot mode with the requested runtime mode.",
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session.mode.set",
+                detail:
+                  cause instanceof Error
+                    ? cause.message
+                    : "Failed to synchronize Copilot mode with the requested runtime mode.",
                 cause,
-              ),
+              }),
           }).pipe(
             Effect.catch((cause) =>
               emit({
@@ -1987,7 +1972,11 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           });
           if (!filePath) {
             return Effect.fail(
-              requestError("session.send", `Invalid attachment id '${attachment.id}'.`),
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session.send",
+                detail: `Invalid attachment id '${attachment.id}'.`,
+              }),
             );
           }
           return Effect.succeed({
@@ -2003,7 +1992,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           );
         }
 
-        const turnId = TurnId.make(`copilot-turn-${randomUUID()}`);
+        const turnId = TurnId.make(`copilot-turn-${yield* Random.nextUUIDv4}`);
         const modelSelection =
           input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
         const reasoningEffort = getCopilotReasoningEffort(modelSelection);
@@ -2016,11 +2005,12 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
               );
             },
             catch: (cause) =>
-              requestError(
-                "session.setModel",
-                cause instanceof Error ? cause.message : "Failed to update Copilot model.",
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session.setModel",
+                detail: cause instanceof Error ? cause.message : "Failed to update Copilot model.",
                 cause,
-              ),
+              }),
           });
           updateProviderSession(context, {
             model: modelSelection.model,
@@ -2035,11 +2025,12 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
         yield* Effect.tryPromise({
           try: () => syncSessionMode(context, mode),
           catch: (cause) =>
-            requestError(
-              "session.mode.set",
-              cause instanceof Error ? cause.message : "Failed to update Copilot mode.",
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "session.mode.set",
+              detail: cause instanceof Error ? cause.message : "Failed to update Copilot mode.",
               cause,
-            ),
+            }),
         });
 
         ensureTurnSnapshot(context, turnId);
@@ -2072,11 +2063,12 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
         yield* Effect.tryPromise({
           try: () => context.sdkSession.send(messageOptions),
           catch: (cause) =>
-            requestError(
-              "session.send",
-              cause instanceof Error ? cause.message : "Failed to send Copilot turn.",
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "session.send",
+              detail: cause instanceof Error ? cause.message : "Failed to send Copilot turn.",
               cause,
-            ),
+            }),
         }).pipe(
           Effect.catch((error) =>
             Effect.gen(function* () {
@@ -2118,11 +2110,12 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           yield* Effect.tryPromise({
             try: () => context.sdkSession.abort(),
             catch: (cause) =>
-              requestError(
-                "session.abort",
-                cause instanceof Error ? cause.message : "Failed to abort Copilot turn.",
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session.abort",
+                detail: cause instanceof Error ? cause.message : "Failed to abort Copilot turn.",
                 cause,
-              ),
+              }),
           });
 
           const targetTurnId = turnId ?? context.activeTurnId;
@@ -2148,27 +2141,18 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
 
         const binding = context.pendingPermissionBindings.get(requestId);
         if (!binding) {
-          return yield* requestError(
-            "permission.reply",
-            `Unknown pending permission request: ${requestId}`,
-          );
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "permission.reply",
+            detail: `Unknown pending permission request: ${requestId}`,
+          });
         }
 
         const result: PermissionRequestResult =
           decision === "accept" || decision === "acceptForSession"
             ? { kind: "approved" }
             : { kind: "denied-interactively-by-user" };
-        yield* Effect.tryPromise({
-          try: async () => {
-            binding.promiseKit.resolve(result);
-          },
-          catch: (cause) =>
-            requestError(
-              "permission.reply",
-              cause instanceof Error ? cause.message : "Failed to resolve Copilot permission.",
-              cause,
-            ),
-        });
+        yield* Deferred.succeed(binding.deferred, result);
       });
 
       const respondToUserInput: CopilotAdapterShape["respondToUserInput"] = Effect.fn(
@@ -2178,24 +2162,15 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
 
         const binding = context.pendingUserInputBindings.get(requestId);
         if (!binding) {
-          return yield* requestError(
-            "user_input.reply",
-            `Unknown pending user-input request: ${requestId}`,
-          );
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "user_input.reply",
+            detail: `Unknown pending user-input request: ${requestId}`,
+          });
         }
 
         const response = answerFromUserInput(binding, answers);
-        yield* Effect.tryPromise({
-          try: async () => {
-            binding.promiseKit.resolve(response);
-          },
-          catch: (cause) =>
-            requestError(
-              "user_input.reply",
-              cause instanceof Error ? cause.message : "Failed to resolve Copilot user input.",
-              cause,
-            ),
-        });
+        yield* Deferred.succeed(binding.deferred, response);
       });
 
       const stopSessionInternal = async (threadId: ThreadId): Promise<void> => {
@@ -2209,8 +2184,8 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
         }
 
         context.stopped = true;
-        settlePendingPermissionHandlers(context);
-        settlePendingUserInputs(context);
+        await settlePendingPermissionHandlers(context);
+        await settlePendingUserInputs(context);
         try {
           await context.sdkSession.disconnect();
         } catch {
@@ -2290,10 +2265,11 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           if (!sessions.has(threadId)) {
             return yield* sessionNotFoundError(threadId);
           }
-          return yield* requestError(
-            "thread.rollback",
-            "Copilot SDK does not expose thread rollback.",
-          );
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "thread.rollback",
+            detail: "Copilot SDK does not expose thread rollback.",
+          });
         },
       );
 
@@ -2308,11 +2284,12 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             }
           },
           catch: (cause) =>
-            requestError(
-              "stopAll",
-              cause instanceof Error ? cause.message : "Failed to stop Copilot sessions.",
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "stopAll",
+              detail: cause instanceof Error ? cause.message : "Failed to stop Copilot sessions.",
               cause,
-            ),
+            }),
         });
 
       return {
