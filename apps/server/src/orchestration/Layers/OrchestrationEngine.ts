@@ -17,6 +17,7 @@ import {
   PubSub,
   Queue,
   Schema,
+  Semaphore,
   Stream,
 } from "effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -82,6 +83,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
 
   const commandQueue = yield* Queue.unbounded<CommandEnvelope>();
   const eventPubSub = yield* PubSub.unbounded<OrchestrationEvent>();
+  const fullReadModelHydrationSemaphore = yield* Semaphore.make(1);
 
   const projectEventsOntoReadModel = (
     baseReadModel: OrchestrationReadModel,
@@ -112,22 +114,37 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       return yield* projectEventsOntoReadModel(baseReadModel, persistedEvents);
     });
 
-  const hydrateFullReadModel = (): Effect.Effect<OrchestrationReadModel, never, never> =>
-    Effect.gen(function* () {
-      if (fullReadModel !== null) {
-        return fullReadModel;
-      }
+  const hydrateFullReadModel = (): Effect.Effect<OrchestrationReadModel, never, never> => {
+    if (fullReadModel !== null) {
+      return Effect.succeed(fullReadModel);
+    }
 
-      let nextFullReadModel = yield* projectionSnapshotQuery.getSnapshot().pipe(Effect.orDie);
-      nextFullReadModel = yield* reconcileHydratedReadModel(nextFullReadModel);
-      fullReadModel = nextFullReadModel;
+    return fullReadModelHydrationSemaphore.withPermit(
+      Effect.gen(function* () {
+        if (fullReadModel !== null) {
+          return fullReadModel;
+        }
 
-      if (commandReadModel.snapshotSequence > fullReadModel.snapshotSequence) {
-        fullReadModel = yield* reconcileHydratedReadModel(fullReadModel);
-      }
+        let nextFullReadModel = yield* projectionSnapshotQuery.getSnapshot().pipe(Effect.orDie);
+        nextFullReadModel = yield* reconcileHydratedReadModel(nextFullReadModel);
 
-      return fullReadModel;
-    });
+        while (nextFullReadModel.snapshotSequence < commandReadModel.snapshotSequence) {
+          const previousSequence = nextFullReadModel.snapshotSequence;
+          nextFullReadModel = yield* reconcileHydratedReadModel(nextFullReadModel);
+          if (nextFullReadModel.snapshotSequence === previousSequence) {
+            return yield* Effect.die(
+              new Error(
+                `Unable to hydrate orchestration read model to command sequence ${commandReadModel.snapshotSequence}; stuck at sequence ${nextFullReadModel.snapshotSequence}.`,
+              ),
+            );
+          }
+        }
+
+        fullReadModel = nextFullReadModel;
+        return nextFullReadModel;
+      }),
+    );
+  };
 
   const processEnvelope = (envelope: CommandEnvelope): Effect.Effect<void> => {
     const dispatchStartSequence = commandReadModel.snapshotSequence;

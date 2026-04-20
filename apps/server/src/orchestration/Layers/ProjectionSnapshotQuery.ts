@@ -445,6 +445,30 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         JOIN projection_turns turns
           ON turns.thread_id = threads.thread_id
           AND turns.turn_id = threads.latest_turn_id
+        WHERE threads.latest_turn_id IS NOT NULL
+        ORDER BY turns.thread_id ASC
+      `,
+  });
+
+  const listActiveLatestTurnRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionLatestTurnDbRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          turns.thread_id AS "threadId",
+          turns.turn_id AS "turnId",
+          turns.state,
+          turns.requested_at AS "requestedAt",
+          turns.started_at AS "startedAt",
+          turns.completed_at AS "completedAt",
+          turns.assistant_message_id AS "assistantMessageId",
+          turns.source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
+          turns.source_proposed_plan_id AS "sourceProposedPlanId"
+        FROM projection_threads threads
+        JOIN projection_turns turns
+          ON turns.thread_id = threads.thread_id
+          AND turns.turn_id = threads.latest_turn_id
         WHERE threads.deleted_at IS NULL
           AND threads.latest_turn_id IS NOT NULL
         ORDER BY turns.thread_id ASC
@@ -1216,7 +1240,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               ),
             ),
           ),
-          listLatestTurnRows(undefined).pipe(
+          listActiveLatestTurnRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
                 "ProjectionSnapshotQuery.getShellSnapshot:listLatestTurns:query",
