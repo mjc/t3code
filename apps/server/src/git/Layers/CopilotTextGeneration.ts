@@ -1,15 +1,19 @@
-import { Effect, Layer, Schema } from "effect";
+import type { CopilotClient, CopilotSession } from "@github/copilot-sdk";
+import { Effect, Exit, Fiber, Layer, Schema, Scope } from "effect";
+import * as Semaphore from "effect/Semaphore";
 
 import {
   type ChatAttachment,
   type CopilotModelSelection,
+  type CopilotSettings,
   TextGenerationError,
 } from "@t3tools/contracts";
 import { sanitizeBranchFragment, sanitizeFeatureBranchName } from "@t3tools/shared/git";
+import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
-import { createCopilotClient } from "../../provider/copilotRuntime.ts";
+import { createCopilotClient, trimOrUndefined } from "../../provider/copilotRuntime.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import {
   buildBranchNamePrompt,
@@ -19,7 +23,6 @@ import {
 } from "../Prompts.ts";
 import { type TextGenerationShape, TextGeneration } from "../Services/TextGeneration.ts";
 import {
-  getModelSelectionStringOptionValue,
   extractJsonObject,
   sanitizeCommitSubject,
   sanitizePrTitle,
@@ -28,6 +31,24 @@ import {
 } from "../Utils.ts";
 
 const COPILOT_TIMEOUT_MS = 180_000;
+const COPILOT_TEXT_GENERATION_IDLE_TTL = "30 seconds";
+
+type CopilotTextGenerationOperation =
+  | "generateCommitMessage"
+  | "generatePrContent"
+  | "generateBranchName"
+  | "generateThreadTitle";
+
+interface SharedCopilotTextClientState {
+  readonly client: CopilotClient;
+  activeRequests: number;
+  idleCloseFiber: Fiber.Fiber<void, never> | null;
+}
+
+interface SharedCopilotTextClientLease {
+  readonly clientKey: string;
+  readonly client: CopilotClient;
+}
 
 function isTextGenerationError(error: unknown): error is TextGenerationError {
   return (
@@ -48,16 +69,164 @@ ${schemaDocument}
 Do not wrap the JSON in markdown fences or include any other text.`;
 }
 
+function copilotTextGenerationError(
+  operation: CopilotTextGenerationOperation,
+  detail: string,
+  cause?: unknown,
+): TextGenerationError {
+  return new TextGenerationError({
+    operation,
+    detail,
+    ...(cause !== undefined ? { cause } : {}),
+  });
+}
+
+function detailFromCause(cause: unknown, fallback: string): string {
+  return cause instanceof Error && cause.message.trim().length > 0 ? cause.message : fallback;
+}
+
+function copilotTextClientKey(input: {
+  readonly settings: CopilotSettings;
+  readonly cwd: string;
+}): string {
+  return JSON.stringify({
+    cwd: input.cwd,
+    binaryPath: trimOrUndefined(input.settings.binaryPath) ?? null,
+    serverUrl: trimOrUndefined(input.settings.serverUrl) ?? null,
+  });
+}
+
 const makeCopilotTextGeneration = Effect.gen(function* () {
   const serverConfig = yield* ServerConfig;
   const serverSettingsService = yield* ServerSettingsService;
+  const idleFiberScope = yield* Effect.acquireRelease(Scope.make(), (scope) =>
+    Scope.close(scope, Exit.void),
+  );
+  const sharedClientMutex = yield* Semaphore.make(1);
+  const sharedClients = new Map<string, SharedCopilotTextClientState>();
+
+  const closeSharedClient = (clientKey: string) =>
+    Effect.gen(function* () {
+      const state = sharedClients.get(clientKey);
+      if (!state) {
+        return;
+      }
+
+      sharedClients.delete(clientKey);
+      const idleCloseFiber = state.idleCloseFiber;
+      state.idleCloseFiber = null;
+      if (idleCloseFiber !== null) {
+        yield* Fiber.interrupt(idleCloseFiber).pipe(Effect.ignore);
+      }
+      yield* Effect.tryPromise({
+        try: () => state.client.stop(),
+        catch: () => undefined,
+      }).pipe(Effect.ignore);
+    });
+
+  const cancelIdleCloseFiber = (state: SharedCopilotTextClientState) =>
+    Effect.gen(function* () {
+      const idleCloseFiber = state.idleCloseFiber;
+      state.idleCloseFiber = null;
+      if (idleCloseFiber !== null) {
+        yield* Fiber.interrupt(idleCloseFiber).pipe(Effect.ignore);
+      }
+    });
+
+  const scheduleIdleClose = (clientKey: string, state: SharedCopilotTextClientState) =>
+    Effect.gen(function* () {
+      yield* cancelIdleCloseFiber(state);
+      const fiber = yield* Effect.sleep(COPILOT_TEXT_GENERATION_IDLE_TTL).pipe(
+        Effect.andThen(
+          sharedClientMutex.withPermit(
+            Effect.gen(function* () {
+              const current = sharedClients.get(clientKey);
+              if (!current || current !== state || current.activeRequests > 0) {
+                return;
+              }
+
+              current.idleCloseFiber = null;
+              yield* closeSharedClient(clientKey);
+            }),
+          ),
+        ),
+        Effect.forkIn(idleFiberScope),
+      );
+      state.idleCloseFiber = fiber;
+    });
+
+  const acquireSharedClient = (input: {
+    readonly operation: CopilotTextGenerationOperation;
+    readonly cwd: string;
+    readonly settings: CopilotSettings;
+  }): Effect.Effect<SharedCopilotTextClientLease, TextGenerationError> =>
+    Effect.gen(function* () {
+      const clientKey = copilotTextClientKey({
+        settings: input.settings,
+        cwd: input.cwd,
+      });
+
+      const client = yield* sharedClientMutex.withPermit(
+        Effect.gen(function* () {
+          const existing = sharedClients.get(clientKey);
+          if (existing) {
+            yield* cancelIdleCloseFiber(existing);
+            existing.activeRequests += 1;
+            return existing.client;
+          }
+
+          const client = createCopilotClient({
+            settings: input.settings,
+            cwd: input.cwd,
+            logLevel: "error",
+          });
+          yield* Effect.tryPromise({
+            try: () => client.start(),
+            catch: (cause) =>
+              copilotTextGenerationError(
+                input.operation,
+                detailFromCause(cause, "Failed to start Copilot client."),
+                cause,
+              ),
+          });
+
+          sharedClients.set(clientKey, {
+            client,
+            activeRequests: 1,
+            idleCloseFiber: null,
+          });
+          return client;
+        }),
+      );
+
+      return { clientKey, client };
+    });
+
+  const releaseSharedClient = (lease: SharedCopilotTextClientLease) =>
+    sharedClientMutex.withPermit(
+      Effect.gen(function* () {
+        const state = sharedClients.get(lease.clientKey);
+        if (!state || state.client !== lease.client) {
+          return;
+        }
+
+        state.activeRequests = Math.max(0, state.activeRequests - 1);
+        if (state.activeRequests === 0) {
+          yield* scheduleIdleClose(lease.clientKey, state);
+        }
+      }),
+    );
+
+  yield* Effect.addFinalizer(() =>
+    sharedClientMutex.withPermit(
+      Effect.forEach([...sharedClients.keys()], (clientKey) => closeSharedClient(clientKey), {
+        discard: true,
+      }),
+    ),
+  );
 
   const runCopilotJson = <S extends Schema.Top>(input: {
-    readonly operation:
-      | "generateCommitMessage"
-      | "generatePrContent"
-      | "generateBranchName"
-      | "generateThreadTitle";
+    readonly operation: CopilotTextGenerationOperation;
     readonly cwd: string;
     readonly prompt: string;
     readonly outputSchemaJson: S;
@@ -92,65 +261,68 @@ const makeCopilotTextGeneration = Effect.gen(function* () {
         })
         .filter((attachment): attachment is NonNullable<typeof attachment> => attachment !== null);
 
-      const rawContent = yield* Effect.tryPromise({
-        try: async () => {
-          const reasoningEffort = getModelSelectionStringOptionValue(
-            input.modelSelection,
-            "reasoningEffort",
-          );
-          const client = createCopilotClient({
-            settings,
-            cwd: input.cwd,
-            logLevel: "error",
-          });
-
-          try {
-            await client.start();
-            const session = await client.createSession({
-              clientName: "t3-code-git-text",
-              model: input.modelSelection.model,
-              ...(reasoningEffort ? { reasoningEffort } : {}),
-              workingDirectory: input.cwd,
-              streaming: false,
-              availableTools: [],
-              enableConfigDiscovery: false,
-              onPermissionRequest: () => ({
-                kind: "denied-no-approval-rule-and-could-not-request-from-user",
-              }),
-            });
-
-            try {
-              const response = await session.sendAndWait(
-                {
-                  prompt: copilotJsonPrompt(input.prompt, input.outputSchemaJson),
-                  ...(fileAttachments.length > 0 ? { attachments: fileAttachments } : {}),
+      const reasoningEffort = getModelSelectionStringOptionValue(
+        input.modelSelection,
+        "reasoningEffort",
+      );
+      // Keep request state isolated per generation call while reusing the
+      // started SDK client so git helpers do not respawn the Copilot CLI.
+      const rawContent = yield* Effect.acquireUseRelease(
+        acquireSharedClient({
+          operation: input.operation,
+          cwd: input.cwd,
+          settings,
+        }),
+        ({ client }) =>
+          Effect.acquireUseRelease(
+            Effect.tryPromise({
+              try: () =>
+                client.createSession({
+                  clientName: "t3-code-git-text",
+                  model: input.modelSelection.model,
+                  ...(reasoningEffort ? { reasoningEffort } : {}),
+                  workingDirectory: input.cwd,
+                  streaming: false,
+                  availableTools: [],
+                  enableConfigDiscovery: false,
+                  onPermissionRequest: () => ({
+                    kind: "denied-no-approval-rule-and-could-not-request-from-user",
+                  }),
+                }),
+              catch: (cause) =>
+                copilotTextGenerationError(
+                  input.operation,
+                  detailFromCause(cause, "Failed to create Copilot session."),
+                  cause,
+                ),
+            }),
+            (session: CopilotSession) =>
+              Effect.tryPromise({
+                try: async () => {
+                  const response = await session.sendAndWait(
+                    {
+                      prompt: copilotJsonPrompt(input.prompt, input.outputSchemaJson),
+                      ...(fileAttachments.length > 0 ? { attachments: fileAttachments } : {}),
+                    },
+                    COPILOT_TIMEOUT_MS,
+                  );
+                  return response?.data.content.trim() ?? "";
                 },
-                COPILOT_TIMEOUT_MS,
-              );
-              return response?.data.content.trim() ?? "";
-            } finally {
-              await session.disconnect().catch(() => {
-                // Best effort cleanup.
-              });
-            }
-          } finally {
-            await client.stop().catch(() => {
-              // Best effort cleanup.
-            });
-          }
-        },
-        catch: (cause) =>
-          isTextGenerationError(cause)
-            ? cause
-            : new TextGenerationError({
-                operation: input.operation,
-                detail:
-                  cause instanceof Error
-                    ? cause.message
-                    : "Copilot text generation request failed.",
-                cause,
+                catch: (cause) =>
+                  copilotTextGenerationError(
+                    input.operation,
+                    detailFromCause(cause, "Copilot text generation request failed."),
+                    cause,
+                  ),
               }),
-      });
+            (session) =>
+              Effect.tryPromise({
+                try: () => session.disconnect(),
+                catch: () => undefined,
+              }).pipe(Effect.ignore),
+          ),
+        releaseSharedClient,
+      );
 
       if (rawContent.length === 0) {
         return yield* new TextGenerationError({

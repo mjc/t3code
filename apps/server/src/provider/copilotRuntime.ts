@@ -46,7 +46,7 @@ export class CopilotProbePromiseError extends Error {
   }
 }
 
-function trimOrUndefined(value: string | null | undefined): string | undefined {
+export function trimOrUndefined(value: string | null | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
 }
