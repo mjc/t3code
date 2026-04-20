@@ -215,6 +215,21 @@ function buildCodexProvider(models: ServerProvider["models"]): ServerProvider {
   };
 }
 
+function buildCopilotProvider(models: ServerProvider["models"]): ServerProvider {
+  return {
+    provider: "copilot",
+    enabled: true,
+    installed: true,
+    version: "1.0.0",
+    status: "ready",
+    auth: { status: "authenticated" },
+    checkedAt: new Date().toISOString(),
+    models,
+    slashCommands: [],
+    skills: [],
+  };
+}
+
 function buildOpenCodeProvider(models: ServerProvider["models"]): ServerProvider {
   return {
     provider: "opencode",
@@ -334,11 +349,71 @@ describe("ProviderModelPicker", () => {
       await page.getByRole("button").click();
 
       await vi.waitFor(() => {
-        expect(getSidebarProviderOrder().slice(0, 3)).toEqual([
+        expect(getSidebarProviderOrder().slice(0, 4)).toEqual([
           "favorites",
           "codex",
+          "copilot",
           "claudeAgent",
         ]);
+      });
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("shows the real copilot provider alongside the coming-soon copilot badge item", async () => {
+    const providers: ReadonlyArray<ServerProvider> = [
+      TEST_PROVIDERS[0]!,
+      buildCopilotProvider([
+        {
+          slug: "auto",
+          name: "Auto",
+          isCustom: false,
+          capabilities: {
+            reasoningEffortLevels: [effort("low"), effort("medium", true), effort("high")],
+            supportsFastMode: false,
+            supportsThinkingToggle: false,
+            contextWindowOptions: [],
+            promptInjectedEffortLevels: [],
+          },
+        },
+        {
+          slug: "gpt-4.1",
+          name: "GPT-4.1",
+          isCustom: false,
+          capabilities: {
+            reasoningEffortLevels: [effort("low"), effort("medium", true), effort("high")],
+            supportsFastMode: false,
+            supportsThinkingToggle: false,
+            contextWindowOptions: [],
+            promptInjectedEffortLevels: [],
+          },
+        },
+      ]),
+      TEST_PROVIDERS[1]!,
+    ];
+    const mounted = await mountPicker({
+      provider: "claudeAgent",
+      model: "claude-opus-4-6",
+      lockedProvider: null,
+      providers,
+    });
+
+    try {
+      await page.getByRole("button").click();
+
+      await vi.waitFor(() => {
+        expect(getSidebarProviderOrder()).toContain("copilot");
+        expect(getSidebarProviderOrder()).toContain("github-copilot-coming-soon");
+      });
+
+      await page.getByRole("button", { name: "Copilot", exact: true }).click();
+
+      await vi.waitFor(() => {
+        const listText = getModelPickerListText();
+        expect(listText).toContain("Auto");
+        expect(listText).toContain("GPT-4.1");
+        expect(listText).not.toContain("Claude Opus 4.6");
       });
     } finally {
       await mounted.cleanup();
@@ -453,6 +528,7 @@ describe("ProviderModelPicker", () => {
         { slug: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
       ],
       codex: [{ slug: "gpt-5-codex", name: "GPT-5 Codex" }],
+      copilot: [],
       cursor: [],
       opencode: [],
     } as const;
