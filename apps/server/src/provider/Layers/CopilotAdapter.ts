@@ -23,7 +23,7 @@ import {
   type UserInputQuestion,
 } from "@t3tools/contracts";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
-import { Deferred, Effect, Layer, Path, Predicate, PubSub, Random, Schema, Stream } from "effect";
+import { Deferred, Effect, Layer, Path, Predicate, PubSub, Random, Stream } from "effect";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
@@ -140,6 +140,15 @@ interface CopilotSessionContext {
   stopped: boolean;
 }
 
+const APPROVED_PERMISSION_RESULT = { kind: "approved" } satisfies PermissionRequestResult;
+const DENIED_PERMISSION_RESULT = {
+  kind: "denied-interactively-by-user",
+} satisfies PermissionRequestResult;
+const EMPTY_USER_INPUT_RESPONSE = {
+  answer: "",
+  wasFreeform: true,
+} satisfies CopilotUserInputResponse;
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -254,34 +263,26 @@ function sessionNotFoundError(threadId: ThreadId): ProviderAdapterSessionNotFoun
   });
 }
 
-function requireSessionContext(
-  sessions: ReadonlyMap<ThreadId, CopilotSessionContext>,
-  threadId: ThreadId,
-): CopilotSessionContext {
-  const context = sessions.get(threadId);
-  if (!context) {
-    throw sessionNotFoundError(threadId);
-  }
-  if (context.stopped) {
-    throw sessionClosedError(threadId);
-  }
-  return context;
+function detailFromCause(cause: unknown, fallback: string): string {
+  return cause instanceof Error && cause.message.trim().length > 0 ? cause.message : fallback;
 }
 
-function requireSessionContextEffect(
+function requireSessionContext(
   sessions: ReadonlyMap<ThreadId, CopilotSessionContext>,
   threadId: ThreadId,
 ): Effect.Effect<
   CopilotSessionContext,
   ProviderAdapterSessionNotFoundError | ProviderAdapterSessionClosedError
 > {
-  return Effect.try({
-    try: () => requireSessionContext(sessions, threadId),
-    catch: (cause) =>
-      Schema.is(ProviderAdapterSessionNotFoundError)(cause) ||
-      Schema.is(ProviderAdapterSessionClosedError)(cause)
-        ? cause
-        : sessionNotFoundError(threadId),
+  return Effect.gen(function* () {
+    const context = sessions.get(threadId);
+    if (!context) {
+      return yield* sessionNotFoundError(threadId);
+    }
+    if (context.stopped) {
+      return yield* sessionClosedError(threadId);
+    }
+    return context;
   });
 }
 
@@ -544,52 +545,40 @@ function answerFromUserInput(
   };
 }
 
-async function settlePendingPermissionHandlers(context: CopilotSessionContext): Promise<void> {
-  for (const handlers of context.pendingPermissionHandlersBySignature.values()) {
-    for (const handler of handlers) {
-      await Effect.runPromise(
-        Deferred.succeed(handler.deferred, { kind: "denied-interactively-by-user" }).pipe(
-          Effect.ignore,
-        ),
-      );
+function settlePendingPermissionHandlers(
+  context: CopilotSessionContext,
+): Effect.Effect<void, never> {
+  return Effect.gen(function* () {
+    for (const handlers of context.pendingPermissionHandlersBySignature.values()) {
+      for (const handler of handlers) {
+        yield* Deferred.succeed(handler.deferred, DENIED_PERMISSION_RESULT).pipe(Effect.ignore);
+      }
     }
-  }
-  context.pendingPermissionHandlersBySignature.clear();
-  context.pendingPermissionEventsBySignature.clear();
+    context.pendingPermissionHandlersBySignature.clear();
+    context.pendingPermissionEventsBySignature.clear();
 
-  for (const binding of context.pendingPermissionBindings.values()) {
-    await Effect.runPromise(
-      Deferred.succeed(binding.deferred, { kind: "denied-interactively-by-user" }).pipe(
-        Effect.ignore,
-      ),
-    );
-  }
-  context.pendingPermissionBindings.clear();
+    for (const binding of context.pendingPermissionBindings.values()) {
+      yield* Deferred.succeed(binding.deferred, DENIED_PERMISSION_RESULT).pipe(Effect.ignore);
+    }
+    context.pendingPermissionBindings.clear();
+  });
 }
 
-async function settlePendingUserInputs(context: CopilotSessionContext): Promise<void> {
-  for (const handlers of context.pendingUserInputHandlersBySignature.values()) {
-    for (const handler of handlers) {
-      await Effect.runPromise(
-        Deferred.succeed(handler.deferred, {
-          answer: "",
-          wasFreeform: true,
-        }).pipe(Effect.ignore),
-      );
+function settlePendingUserInputs(context: CopilotSessionContext): Effect.Effect<void, never> {
+  return Effect.gen(function* () {
+    for (const handlers of context.pendingUserInputHandlersBySignature.values()) {
+      for (const handler of handlers) {
+        yield* Deferred.succeed(handler.deferred, EMPTY_USER_INPUT_RESPONSE).pipe(Effect.ignore);
+      }
     }
-  }
-  context.pendingUserInputHandlersBySignature.clear();
-  context.pendingUserInputEventsBySignature.clear();
+    context.pendingUserInputHandlersBySignature.clear();
+    context.pendingUserInputEventsBySignature.clear();
 
-  for (const binding of context.pendingUserInputBindings.values()) {
-    await Effect.runPromise(
-      Deferred.succeed(binding.deferred, {
-        answer: "",
-        wasFreeform: true,
-      }).pipe(Effect.ignore),
-    );
-  }
-  context.pendingUserInputBindings.clear();
+    for (const binding of context.pendingUserInputBindings.values()) {
+      yield* Deferred.succeed(binding.deferred, EMPTY_USER_INPUT_RESPONSE).pipe(Effect.ignore);
+    }
+    context.pendingUserInputBindings.clear();
+  });
 }
 
 function latestTurnId(context: CopilotSessionContext): TurnId | undefined {
@@ -664,7 +653,6 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
       const path = yield* Path.Path;
       const runtimeContext = yield* Effect.context();
       const runWithContext = Effect.runPromiseWith(runtimeContext);
-      const runSyncWithContext = Effect.runSyncWith(runtimeContext);
 
       const emit = (event: ProviderRuntimeEvent) =>
         PubSub.publish(runtimeEventPubSub, event).pipe(Effect.asVoid);
@@ -675,6 +663,139 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
               nativeEventLogger.write({ source: "copilot.sdk.event", payload: event }, threadId),
             )
           : Promise.resolve();
+
+      const copilotSdk = {
+        startClient: (threadId: ThreadId, client: CopilotClient) =>
+          Effect.tryPromise({
+            try: () => client.start(),
+            catch: (cause) =>
+              processError(
+                threadId,
+                detailFromCause(cause, "Failed to start Copilot client."),
+                cause,
+              ),
+          }),
+        stopClient: (threadId: ThreadId, client: CopilotClient) =>
+          Effect.tryPromise({
+            try: () => client.stop(),
+            catch: (cause) =>
+              processError(
+                threadId,
+                detailFromCause(cause, "Failed to stop Copilot client."),
+                cause,
+              ),
+          }),
+        createSession: (
+          threadId: ThreadId,
+          client: CopilotClient,
+          config: SessionConfig,
+        ): Effect.Effect<CopilotSession, ProviderAdapterProcessError> =>
+          Effect.tryPromise({
+            try: () => client.createSession(config),
+            catch: (cause) =>
+              processError(
+                threadId,
+                detailFromCause(cause, "Failed to create Copilot session."),
+                cause,
+              ),
+          }),
+        resumeSession: (
+          threadId: ThreadId,
+          client: CopilotClient,
+          sessionId: string,
+          config: SessionConfig,
+        ): Effect.Effect<CopilotSession, ProviderAdapterProcessError> =>
+          Effect.tryPromise({
+            try: () => client.resumeSession(sessionId, config),
+            catch: (cause) =>
+              processError(
+                threadId,
+                detailFromCause(cause, "Failed to resume Copilot session."),
+                cause,
+              ),
+          }),
+        setMode: (
+          context: CopilotSessionContext,
+          mode: CopilotMode,
+        ): Effect.Effect<void, ProviderAdapterRequestError> =>
+          Effect.tryPromise({
+            try: () => context.sdkSession.rpc.mode.set({ mode }),
+            catch: (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session.mode.set",
+                detail: detailFromCause(cause, "Failed to update Copilot mode."),
+                cause,
+              }),
+          }),
+        readPlan: (
+          context: CopilotSessionContext,
+        ): Effect.Effect<string, ProviderAdapterRequestError> =>
+          Effect.tryPromise({
+            try: async () => (await context.sdkSession.rpc.plan.read()).content ?? "",
+            catch: (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session.plan.read",
+                detail: detailFromCause(cause, "Failed to read Copilot plan."),
+                cause,
+              }),
+          }),
+        setModel: (
+          context: CopilotSessionContext,
+          model: string,
+          reasoningEffort?: CopilotReasoningEffort | undefined,
+        ): Effect.Effect<void, ProviderAdapterRequestError> =>
+          Effect.tryPromise({
+            try: () =>
+              context.sdkSession.setModel(model, reasoningEffort ? { reasoningEffort } : {}),
+            catch: (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session.setModel",
+                detail: detailFromCause(cause, "Failed to update Copilot model."),
+                cause,
+              }),
+          }),
+        send: (
+          context: CopilotSessionContext,
+          messageOptions: MessageOptions,
+        ): Effect.Effect<void, ProviderAdapterRequestError> =>
+          Effect.tryPromise({
+            try: () => context.sdkSession.send(messageOptions),
+            catch: (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session.send",
+                detail: detailFromCause(cause, "Failed to send Copilot turn."),
+                cause,
+              }),
+          }),
+        abort: (context: CopilotSessionContext): Effect.Effect<void, ProviderAdapterRequestError> =>
+          Effect.tryPromise({
+            try: () => context.sdkSession.abort(),
+            catch: (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session.abort",
+                detail: detailFromCause(cause, "Failed to abort Copilot turn."),
+                cause,
+              }),
+          }),
+        disconnect: (
+          context: CopilotSessionContext,
+        ): Effect.Effect<void, ProviderAdapterRequestError> =>
+          Effect.tryPromise({
+            try: () => context.sdkSession.disconnect(),
+            catch: (cause) =>
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session.disconnect",
+                detail: detailFromCause(cause, "Failed to disconnect Copilot session."),
+                cause,
+              }),
+          }),
+      } as const;
 
       const enqueueSdkEvent = (context: CopilotSessionContext, event: SessionEvent) => {
         context.eventChain = context.eventChain
@@ -795,12 +916,12 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
         });
       };
 
-      const emitPermissionRequestOpened = async (
+      const emitPermissionRequestOpened = (
         context: CopilotSessionContext,
         pending: PendingPermissionBinding,
         data: SessionPermissionRequestedEvent["data"],
-      ) => {
-        await emitAsync({
+      ): Effect.Effect<void> =>
+        emit({
           ...createBaseEvent({
             threadId: context.threadId,
             requestId: pending.requestId,
@@ -824,14 +945,13 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             args: data.permissionRequest,
           },
         });
-      };
 
-      const emitUserInputRequested = async (
+      const emitUserInputRequested = (
         context: CopilotSessionContext,
         requestId: string,
         request: PendingUserInputBinding,
         raw?: SessionEvent,
-      ) => {
+      ): Effect.Effect<void> => {
         const options = request.choices.map((choice) => ({
           label: choice,
           description: choice,
@@ -845,7 +965,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             ...(options.length > 1 ? { multiSelect: false } : {}),
           },
         ];
-        await emitAsync({
+        return emit({
           ...createBaseEvent({
             threadId: context.threadId,
             requestId,
@@ -858,176 +978,180 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
         });
       };
 
-      const bindPermissionRequests = async (
+      const bindPermissionRequests = (
         context: CopilotSessionContext,
         signature: string,
-      ): Promise<void> => {
-        const pendingHandlers = context.pendingPermissionHandlersBySignature.get(signature);
-        const pendingEvents = context.pendingPermissionEventsBySignature.get(signature);
-        if (!pendingHandlers?.length || !pendingEvents?.length) {
-          return;
-        }
-
-        while (pendingHandlers.length > 0 && pendingEvents.length > 0) {
-          const handler = pendingHandlers.shift()!;
-          const eventData = pendingEvents.shift()!;
-          const requestId = eventData.requestId.trim();
-          context.pendingPermissionBindings.set(requestId, {
-            requestId,
-            requestType: mapPermissionRequestType(eventData.permissionRequest),
-            deferred: handler.deferred,
-          });
-          if (
-            context.session.runtimeMode === "approval-required" &&
-            eventData.resolvedByHook !== true
-          ) {
-            await emitPermissionRequestOpened(
-              context,
-              context.pendingPermissionBindings.get(requestId)!,
-              eventData,
-            );
+      ): Effect.Effect<void> =>
+        Effect.gen(function* () {
+          const pendingHandlers = context.pendingPermissionHandlersBySignature.get(signature);
+          const pendingEvents = context.pendingPermissionEventsBySignature.get(signature);
+          if (!pendingHandlers?.length || !pendingEvents?.length) {
+            return;
           }
-        }
 
-        if (pendingHandlers.length === 0) {
-          context.pendingPermissionHandlersBySignature.delete(signature);
-        }
-        if (pendingEvents.length === 0) {
-          context.pendingPermissionEventsBySignature.delete(signature);
-        }
-      };
+          while (pendingHandlers.length > 0 && pendingEvents.length > 0) {
+            const handler = pendingHandlers.shift()!;
+            const eventData = pendingEvents.shift()!;
+            const requestId = eventData.requestId.trim();
+            context.pendingPermissionBindings.set(requestId, {
+              requestId,
+              requestType: mapPermissionRequestType(eventData.permissionRequest),
+              deferred: handler.deferred,
+            });
+            if (
+              context.session.runtimeMode === "approval-required" &&
+              eventData.resolvedByHook !== true
+            ) {
+              yield* emitPermissionRequestOpened(
+                context,
+                context.pendingPermissionBindings.get(requestId)!,
+                eventData,
+              );
+            }
+          }
 
-      const bindUserInputRequests = async (
+          if (pendingHandlers.length === 0) {
+            context.pendingPermissionHandlersBySignature.delete(signature);
+          }
+          if (pendingEvents.length === 0) {
+            context.pendingPermissionEventsBySignature.delete(signature);
+          }
+        });
+
+      const bindUserInputRequests = (
         context: CopilotSessionContext,
         signature: string,
-      ): Promise<void> => {
-        const pendingHandlers = context.pendingUserInputHandlersBySignature.get(signature);
-        const pendingEvents = context.pendingUserInputEventsBySignature.get(signature);
-        if (!pendingHandlers?.length || !pendingEvents?.length) {
-          return;
-        }
+      ): Effect.Effect<void> =>
+        Effect.gen(function* () {
+          const pendingHandlers = context.pendingUserInputHandlersBySignature.get(signature);
+          const pendingEvents = context.pendingUserInputEventsBySignature.get(signature);
+          if (!pendingHandlers?.length || !pendingEvents?.length) {
+            return;
+          }
 
-        while (pendingHandlers.length > 0 && pendingEvents.length > 0) {
-          const handler = pendingHandlers.shift()!;
-          const eventData = pendingEvents.shift()!;
-          const requestId = eventData.requestId.trim();
-          const binding: PendingUserInputBinding = {
-            requestId,
-            question: eventData.question.trim(),
-            choices: eventData.choices?.map((choice) => choice.trim()).filter(Boolean) ?? [],
-            allowFreeform: eventData.allowFreeform ?? true,
-            deferred: handler.deferred,
-          };
-          context.pendingUserInputBindings.set(requestId, binding);
-          await emitUserInputRequested(context, requestId, binding, {
-            id: requestId,
-            timestamp: nowIso(),
-            parentId: null,
-            type: "user_input.requested",
-            ephemeral: true,
-            data: eventData,
-          });
-        }
+          while (pendingHandlers.length > 0 && pendingEvents.length > 0) {
+            const handler = pendingHandlers.shift()!;
+            const eventData = pendingEvents.shift()!;
+            const requestId = eventData.requestId.trim();
+            const binding: PendingUserInputBinding = {
+              requestId,
+              question: eventData.question.trim(),
+              choices: eventData.choices?.map((choice) => choice.trim()).filter(Boolean) ?? [],
+              allowFreeform: eventData.allowFreeform ?? true,
+              deferred: handler.deferred,
+            };
+            context.pendingUserInputBindings.set(requestId, binding);
+            yield* emitUserInputRequested(context, requestId, binding, {
+              id: requestId,
+              timestamp: nowIso(),
+              parentId: null,
+              type: "user_input.requested",
+              ephemeral: true,
+              data: eventData,
+            });
+          }
 
-        if (pendingHandlers.length === 0) {
-          context.pendingUserInputHandlersBySignature.delete(signature);
-        }
-        if (pendingEvents.length === 0) {
-          context.pendingUserInputEventsBySignature.delete(signature);
-        }
-      };
+          if (pendingHandlers.length === 0) {
+            context.pendingUserInputHandlersBySignature.delete(signature);
+          }
+          if (pendingEvents.length === 0) {
+            context.pendingUserInputEventsBySignature.delete(signature);
+          }
+        });
 
-      const onPermissionRequest = async (
+      const onPermissionRequest = (
         context: CopilotSessionContext,
         request: PermissionRequest,
-      ): Promise<PermissionRequestResult> => {
-        if (context.session.runtimeMode !== "approval-required") {
-          return { kind: "approved" };
-        }
-        if (context.stopped) {
-          return { kind: "denied-interactively-by-user" };
-        }
+      ): Effect.Effect<PermissionRequestResult> =>
+        Effect.gen(function* () {
+          if (context.session.runtimeMode !== "approval-required") {
+            return APPROVED_PERMISSION_RESULT;
+          }
+          if (context.stopped) {
+            return DENIED_PERMISSION_RESULT;
+          }
 
-        const signature = permissionSignature(request as PermissionRequest & { kind: string });
-        const deferred = runSyncWithContext(Deferred.make<PermissionRequestResult>());
-        const queue = context.pendingPermissionHandlersBySignature.get(signature) ?? [];
-        queue.push({
-          signature,
-          deferred,
+          const signature = permissionSignature(request as PermissionRequest & { kind: string });
+          const deferred = yield* Deferred.make<PermissionRequestResult>();
+          const queue = context.pendingPermissionHandlersBySignature.get(signature) ?? [];
+          queue.push({
+            signature,
+            deferred,
+          });
+          context.pendingPermissionHandlersBySignature.set(signature, queue);
+          yield* bindPermissionRequests(context, signature);
+          return yield* Deferred.await(deferred);
         });
-        context.pendingPermissionHandlersBySignature.set(signature, queue);
-        await bindPermissionRequests(context, signature);
-        return runWithContext(Deferred.await(deferred));
-      };
 
-      const onUserInputRequest = async (
+      const onUserInputRequest = (
         context: CopilotSessionContext,
         request: CopilotUserInputRequest,
-      ): Promise<CopilotUserInputResponse> => {
-        if (context.stopped) {
-          return {
-            answer: "",
-            wasFreeform: true,
-          };
-        }
+      ): Effect.Effect<CopilotUserInputResponse> =>
+        Effect.gen(function* () {
+          if (context.stopped) {
+            return EMPTY_USER_INPUT_RESPONSE;
+          }
 
-        const signature = userInputSignature(request);
-        const deferred = runSyncWithContext(Deferred.make<CopilotUserInputResponse>());
-        const queue = context.pendingUserInputHandlersBySignature.get(signature) ?? [];
-        queue.push({
-          signature,
-          deferred,
+          const signature = userInputSignature(request);
+          const deferred = yield* Deferred.make<CopilotUserInputResponse>();
+          const queue = context.pendingUserInputHandlersBySignature.get(signature) ?? [];
+          queue.push({
+            signature,
+            deferred,
+          });
+          context.pendingUserInputHandlersBySignature.set(signature, queue);
+          yield* bindUserInputRequests(context, signature);
+          return yield* Deferred.await(deferred);
         });
-        context.pendingUserInputHandlersBySignature.set(signature, queue);
-        await bindUserInputRequests(context, signature);
-        return runWithContext(Deferred.await(deferred));
-      };
 
-      const syncSessionMode = async (
+      const syncSessionMode = (
         context: CopilotSessionContext,
         mode: CopilotMode,
-      ): Promise<void> => {
-        await context.sdkSession.rpc.mode.set({ mode });
-        await emitAsync({
-          ...createBaseEvent({
-            threadId: context.threadId,
-          }),
-          type: "session.configured",
-          payload: {
-            config: {
-              mode,
-            },
-          },
-        });
-      };
+      ): Effect.Effect<void, ProviderAdapterRequestError> =>
+        copilotSdk.setMode(context, mode).pipe(
+          Effect.flatMap(() =>
+            emit({
+              ...createBaseEvent({
+                threadId: context.threadId,
+              }),
+              type: "session.configured",
+              payload: {
+                config: {
+                  mode,
+                },
+              },
+            }),
+          ),
+        );
 
-      const emitPlanSnapshot = async (
+      const emitPlanSnapshot = (
         context: CopilotSessionContext,
         raw: SessionEvent,
         fallbackPlan?: string | undefined,
-      ): Promise<void> => {
-        const turnId = context.activeTurnId ?? latestTurnId(context);
-        if (!turnId) {
-          return;
-        }
-        const plan = fallbackPlan
-          ? fallbackPlan.trim()
-          : ((await context.sdkSession.rpc.plan.read()).content ?? "").trim();
-        if (plan.length === 0) {
-          return;
-        }
-        await emitAsync({
-          ...createBaseEvent({
-            threadId: context.threadId,
-            turnId,
-            raw,
-          }),
-          type: "turn.proposed.completed",
-          payload: {
-            planMarkdown: plan,
-          },
+      ): Effect.Effect<void, ProviderAdapterRequestError> =>
+        Effect.gen(function* () {
+          const turnId = context.activeTurnId ?? latestTurnId(context);
+          if (!turnId) {
+            return;
+          }
+          const plan = fallbackPlan
+            ? fallbackPlan.trim()
+            : (yield* copilotSdk.readPlan(context)).trim();
+          if (plan.length === 0) {
+            return;
+          }
+          yield* emit({
+            ...createBaseEvent({
+              threadId: context.threadId,
+              turnId,
+              raw,
+            }),
+            type: "turn.proposed.completed",
+            payload: {
+              planMarkdown: plan,
+            },
+          });
         });
-      };
 
       const handleSdkEvent = async (
         context: CopilotSessionContext,
@@ -1279,7 +1403,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             if (event.data.operation === "delete") {
               return;
             }
-            await emitPlanSnapshot(context, event);
+            await runWithContext(emitPlanSnapshot(context, event));
             return;
           }
           case "session.usage_info": {
@@ -1664,7 +1788,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             const queue = context.pendingPermissionEventsBySignature.get(signature) ?? [];
             queue.push(event.data);
             context.pendingPermissionEventsBySignature.set(signature, queue);
-            await bindPermissionRequests(context, signature);
+            await runWithContext(bindPermissionRequests(context, signature));
             return;
           }
           case "permission.completed": {
@@ -1699,7 +1823,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             const queue = context.pendingUserInputEventsBySignature.get(signature) ?? [];
             queue.push(event.data);
             context.pendingUserInputEventsBySignature.set(signature, queue);
-            await bindUserInputRequests(context, signature);
+            await runWithContext(bindUserInputRequests(context, signature));
             return;
           }
           case "user_input.completed": {
@@ -1725,7 +1849,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             return;
           }
           case "exit_plan_mode.requested": {
-            await emitPlanSnapshot(context, event, event.data.planContent);
+            await runWithContext(emitPlanSnapshot(context, event, event.data.planContent));
             return;
           }
           case "exit_plan_mode.completed":
@@ -1744,17 +1868,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           }
 
           if (sessions.has(input.threadId)) {
-            yield* Effect.tryPromise({
-              try: () => stopSessionInternal(input.threadId),
-              catch: (cause) =>
-                processError(
-                  input.threadId,
-                  cause instanceof Error
-                    ? cause.message
-                    : "Failed to stop existing Copilot session before restart.",
-                  cause,
-                ),
-            });
+            yield* stopSessionInternal(input.threadId);
           }
 
           const settings = yield* Effect.map(
@@ -1790,24 +1904,22 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             enqueueSdkEvent(context, event);
           };
           const onSessionPermissionRequest = (_request: PermissionRequest) => {
-            if (!context) {
-              return Promise.resolve({
-                kind:
-                  input.runtimeMode === "approval-required"
-                    ? "denied-interactively-by-user"
-                    : "approved",
-              } satisfies PermissionRequestResult);
-            }
-            return onPermissionRequest(context, _request);
+            return runWithContext(
+              context
+                ? onPermissionRequest(context, _request)
+                : Effect.succeed(
+                    input.runtimeMode === "approval-required"
+                      ? DENIED_PERMISSION_RESULT
+                      : APPROVED_PERMISSION_RESULT,
+                  ),
+            );
           };
           const onSessionUserInputRequest = (_request: CopilotUserInputRequest) => {
-            if (!context) {
-              return Promise.resolve({
-                answer: "",
-                wasFreeform: true,
-              } satisfies CopilotUserInputResponse);
-            }
-            return onUserInputRequest(context, _request);
+            return runWithContext(
+              context
+                ? onUserInputRequest(context, _request)
+                : Effect.succeed(EMPTY_USER_INPUT_RESPONSE),
+            );
           };
 
           const client = createCopilotClient({
@@ -1835,36 +1947,25 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             | "onEvent"
           >;
 
-          const sdkSession = yield* Effect.tryPromise({
-            try: async () => {
-              await client.start();
-              const resume = parseCopilotResumeCursor(input.resumeCursor);
-              return resume
-                ? client.resumeSession(resume.sessionId, {
-                    ...baseSessionConfig,
-                    onPermissionRequest: onSessionPermissionRequest,
-                    onUserInputRequest: onSessionUserInputRequest,
-                  })
-                : client.createSession({
-                    ...baseSessionConfig,
-                    sessionId: input.threadId,
-                    onPermissionRequest: onSessionPermissionRequest,
-                    onUserInputRequest: onSessionUserInputRequest,
-                  });
-            },
-            catch: (cause) =>
-              processError(
-                input.threadId,
-                cause instanceof Error ? cause.message : "Failed to create Copilot session.",
-                cause,
-              ),
+          const sdkSession = yield* Effect.gen(function* () {
+            yield* copilotSdk.startClient(input.threadId, client);
+            const resume = parseCopilotResumeCursor(input.resumeCursor);
+            if (resume) {
+              return yield* copilotSdk.resumeSession(input.threadId, client, resume.sessionId, {
+                ...baseSessionConfig,
+                onPermissionRequest: onSessionPermissionRequest,
+                onUserInputRequest: onSessionUserInputRequest,
+              });
+            }
+            return yield* copilotSdk.createSession(input.threadId, client, {
+              ...baseSessionConfig,
+              sessionId: input.threadId,
+              onPermissionRequest: onSessionPermissionRequest,
+              onUserInputRequest: onSessionUserInputRequest,
+            });
           }).pipe(
             Effect.tapError(() =>
-              Effect.sync(() => {
-                void client.stop().catch(() => {
-                  // Ignore cleanup failures while surfacing the original start error.
-                });
-              }),
+              copilotSdk.stopClient(input.threadId, client).pipe(Effect.ignore),
             ),
           );
 
@@ -1906,25 +2007,12 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           };
           sessions.set(input.threadId, context);
 
-          yield* Effect.tryPromise({
-            try: () =>
-              syncSessionMode(
-                context,
-                requestedCopilotMode({
-                  runtimeMode: input.runtimeMode,
-                }),
-              ),
-            catch: (cause) =>
-              new ProviderAdapterRequestError({
-                provider: PROVIDER,
-                method: "session.mode.set",
-                detail:
-                  cause instanceof Error
-                    ? cause.message
-                    : "Failed to synchronize Copilot mode with the requested runtime mode.",
-                cause,
-              }),
-          }).pipe(
+          yield* syncSessionMode(
+            context,
+            requestedCopilotMode({
+              runtimeMode: input.runtimeMode,
+            }),
+          ).pipe(
             Effect.catch((cause) =>
               emit({
                 ...createBaseEvent({
@@ -1942,17 +2030,15 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           for (const event of earlyEvents) {
             enqueueSdkEvent(context, event);
           }
-          yield* Effect.tryPromise({
-            try: () => context.eventChain,
-            catch: (cause) =>
+          yield* Effect.promise(() => context.eventChain).pipe(
+            Effect.mapError((cause) =>
               processError(
                 input.threadId,
-                cause instanceof Error
-                  ? cause.message
-                  : "Failed to process Copilot startup events.",
+                detailFromCause(cause, "Failed to process Copilot startup events."),
                 cause,
               ),
-          });
+            ),
+          );
           updateProviderSession(context, {
             status: context.session.status === "connecting" ? "ready" : context.session.status,
           });
@@ -1962,7 +2048,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
       );
 
       const sendTurn: CopilotAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
-        const context = yield* requireSessionContextEffect(sessions, input.threadId);
+        const context = yield* requireSessionContext(sessions, input.threadId);
 
         const text = input.input?.trim();
         const attachments = yield* Effect.forEach(input.attachments ?? [], (attachment) => {
@@ -1997,21 +2083,11 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
         const reasoningEffort = getCopilotReasoningEffort(modelSelection);
         if (modelSelection?.model) {
-          yield* Effect.tryPromise({
-            try: async () => {
-              await context.sdkSession.setModel(
-                modelSelection.model,
-                reasoningEffort ? { reasoningEffort } : {},
-              );
-            },
-            catch: (cause) =>
-              new ProviderAdapterRequestError({
-                provider: PROVIDER,
-                method: "session.setModel",
-                detail: cause instanceof Error ? cause.message : "Failed to update Copilot model.",
-                cause,
-              }),
-          });
+          yield* copilotSdk.setModel(
+            context,
+            modelSelection.model,
+            reasoningEffort,
+          );
           updateProviderSession(context, {
             model: modelSelection.model,
             ...(reasoningEffort ? { status: "ready" } : {}),
@@ -2022,16 +2098,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           runtimeMode: context.session.runtimeMode,
           interactionMode: input.interactionMode,
         });
-        yield* Effect.tryPromise({
-          try: () => syncSessionMode(context, mode),
-          catch: (cause) =>
-            new ProviderAdapterRequestError({
-              provider: PROVIDER,
-              method: "session.mode.set",
-              detail: cause instanceof Error ? cause.message : "Failed to update Copilot mode.",
-              cause,
-            }),
-        });
+        yield* syncSessionMode(context, mode);
 
         ensureTurnSnapshot(context, turnId);
         context.queuedTurnIds.push(turnId);
@@ -2060,16 +2127,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           mode: "enqueue",
         };
 
-        yield* Effect.tryPromise({
-          try: () => context.sdkSession.send(messageOptions),
-          catch: (cause) =>
-            new ProviderAdapterRequestError({
-              provider: PROVIDER,
-              method: "session.send",
-              detail: cause instanceof Error ? cause.message : "Failed to send Copilot turn.",
-              cause,
-            }),
-        }).pipe(
+        yield* copilotSdk.send(context, messageOptions).pipe(
           Effect.catch((error) =>
             Effect.gen(function* () {
               const queueIndex = context.queuedTurnIds.indexOf(turnId);
@@ -2105,18 +2163,9 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
 
       const interruptTurn: CopilotAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
         function* (threadId, turnId) {
-          const context = yield* requireSessionContextEffect(sessions, threadId);
+          const context = yield* requireSessionContext(sessions, threadId);
 
-          yield* Effect.tryPromise({
-            try: () => context.sdkSession.abort(),
-            catch: (cause) =>
-              new ProviderAdapterRequestError({
-                provider: PROVIDER,
-                method: "session.abort",
-                detail: cause instanceof Error ? cause.message : "Failed to abort Copilot turn.",
-                cause,
-              }),
-          });
+          yield* copilotSdk.abort(context);
 
           const targetTurnId = turnId ?? context.activeTurnId;
           if (targetTurnId) {
@@ -2137,7 +2186,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
       const respondToRequest: CopilotAdapterShape["respondToRequest"] = Effect.fn(
         "respondToRequest",
       )(function* (threadId, requestId, decision) {
-        const context = yield* requireSessionContextEffect(sessions, threadId);
+        const context = yield* requireSessionContext(sessions, threadId);
 
         const binding = context.pendingPermissionBindings.get(requestId);
         if (!binding) {
@@ -2158,7 +2207,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
       const respondToUserInput: CopilotAdapterShape["respondToUserInput"] = Effect.fn(
         "respondToUserInput",
       )(function* (threadId, requestId, answers) {
-        const context = yield* requireSessionContextEffect(sessions, threadId);
+        const context = yield* requireSessionContext(sessions, threadId);
 
         const binding = context.pendingUserInputBindings.get(requestId);
         if (!binding) {
@@ -2173,71 +2222,56 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
         yield* Deferred.succeed(binding.deferred, response);
       });
 
-      const stopSessionInternal = async (threadId: ThreadId): Promise<void> => {
-        const context = sessions.get(threadId);
-        if (!context) {
-          return;
-        }
-        if (context.stopped) {
+      const stopSessionInternal = (threadId: ThreadId): Effect.Effect<void> =>
+        Effect.gen(function* () {
+          const context = sessions.get(threadId);
+          if (!context) {
+            return;
+          }
+          if (context.stopped) {
+            sessions.delete(threadId);
+            return;
+          }
+
+          context.stopped = true;
+          yield* settlePendingPermissionHandlers(context);
+          yield* settlePendingUserInputs(context);
+          yield* copilotSdk.disconnect(context).pipe(Effect.ignore);
+          yield* copilotSdk.stopClient(threadId, context.client).pipe(Effect.ignore);
+
+          updateProviderSession(context, {
+            status: "closed",
+            activeTurnId: undefined,
+          });
+          yield* emit({
+            ...createBaseEvent({
+              threadId,
+            }),
+            type: "session.state.changed",
+            payload: {
+              state: "stopped",
+              reason: "Copilot session stopped.",
+            },
+          });
+          yield* emit({
+            ...createBaseEvent({
+              threadId,
+            }),
+            type: "session.exited",
+            payload: {
+              reason: "Copilot session stopped.",
+              exitKind: "graceful",
+            },
+          });
           sessions.delete(threadId);
-          return;
-        }
-
-        context.stopped = true;
-        await settlePendingPermissionHandlers(context);
-        await settlePendingUserInputs(context);
-        try {
-          await context.sdkSession.disconnect();
-        } catch {
-          // Best effort cleanup.
-        }
-        try {
-          await context.client.stop();
-        } catch {
-          // Best effort cleanup.
-        }
-
-        updateProviderSession(context, {
-          status: "closed",
-          activeTurnId: undefined,
         });
-        await emitAsync({
-          ...createBaseEvent({
-            threadId,
-          }),
-          type: "session.state.changed",
-          payload: {
-            state: "stopped",
-            reason: "Copilot session stopped.",
-          },
-        });
-        await emitAsync({
-          ...createBaseEvent({
-            threadId,
-          }),
-          type: "session.exited",
-          payload: {
-            reason: "Copilot session stopped.",
-            exitKind: "graceful",
-          },
-        });
-        sessions.delete(threadId);
-      };
 
       const stopSession: CopilotAdapterShape["stopSession"] = Effect.fn("stopSession")(
         function* (threadId) {
           if (!sessions.has(threadId)) {
             return yield* sessionNotFoundError(threadId);
           }
-          yield* Effect.tryPromise({
-            try: () => stopSessionInternal(threadId),
-            catch: (cause) =>
-              processError(
-                threadId,
-                cause instanceof Error ? cause.message : "Failed to stop Copilot session.",
-                cause,
-              ),
-          });
+          yield* stopSessionInternal(threadId);
         },
       );
 
@@ -2249,7 +2283,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
 
       const readThread: CopilotAdapterShape["readThread"] = Effect.fn("readThread")(
         function* (threadId) {
-          const context = yield* requireSessionContextEffect(sessions, threadId);
+          const context = yield* requireSessionContext(sessions, threadId);
           return {
             threadId,
             turns: context.turns.map((turn) => ({
@@ -2274,22 +2308,14 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
       );
 
       const stopAll: CopilotAdapterShape["stopAll"] = () =>
-        Effect.tryPromise({
-          try: async () => {
-            await Promise.all(
-              Array.from(sessions.keys(), (threadId) => stopSessionInternal(threadId)),
-            );
-            if (managedNativeEventLogger) {
-              await runWithContext(managedNativeEventLogger.close());
-            }
-          },
-          catch: (cause) =>
-            new ProviderAdapterRequestError({
-              provider: PROVIDER,
-              method: "stopAll",
-              detail: cause instanceof Error ? cause.message : "Failed to stop Copilot sessions.",
-              cause,
-            }),
+        Effect.gen(function* () {
+          yield* Effect.forEach(Array.from(sessions.keys()), stopSessionInternal, {
+            concurrency: "unbounded",
+            discard: true,
+          });
+          if (managedNativeEventLogger) {
+            yield* managedNativeEventLogger.close();
+          }
         });
 
       return {
