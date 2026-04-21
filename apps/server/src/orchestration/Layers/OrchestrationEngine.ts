@@ -34,6 +34,7 @@ import {
   OrchestrationCommandInvariantError,
   OrchestrationCommandPreviouslyRejectedError,
   type OrchestrationDispatchError,
+  type OrchestrationProjectorDecodeError,
 } from "../Errors.ts";
 import { decideOrchestrationCommand } from "../decider.ts";
 import { createEmptyReadModel, projectEvent } from "../projector.ts";
@@ -85,11 +86,11 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const projectEventsOntoReadModel = (
     baseReadModel: OrchestrationReadModel,
     events: ReadonlyArray<OrchestrationEvent>,
-  ): Effect.Effect<OrchestrationReadModel, never, never> =>
+  ): Effect.Effect<OrchestrationReadModel, OrchestrationProjectorDecodeError, never> =>
     Effect.gen(function* () {
       let nextReadModel = baseReadModel;
       for (const event of events) {
-        nextReadModel = yield* projectEvent(nextReadModel, event).pipe(Effect.orDie);
+        nextReadModel = yield* projectEvent(nextReadModel, event);
       }
       return nextReadModel;
     });
