@@ -7,7 +7,6 @@ import {
   ThreadId,
   TurnId,
   type OrchestrationEvent,
-  type OrchestrationReadModel,
 } from "@t3tools/contracts";
 import { Effect, Layer, ManagedRuntime, Metric, Option, Queue, Stream } from "effect";
 import { describe, expect, it } from "vitest";
@@ -42,9 +41,13 @@ async function createOrchestrationSystem() {
   const ServerConfigLayer = ServerConfig.layerTest(process.cwd(), {
     prefix: "t3-orchestration-engine-test-",
   });
-  const orchestrationLayer = OrchestrationEngineLive.pipe(
-    Layer.provide(OrchestrationProjectionSnapshotQueryLive),
-    Layer.provide(OrchestrationProjectionPipelineLive),
+  const orchestrationLayer = Layer.mergeAll(
+    OrchestrationEngineLive.pipe(
+      Layer.provide(OrchestrationProjectionSnapshotQueryLive),
+      Layer.provide(OrchestrationProjectionPipelineLive),
+    ),
+    OrchestrationProjectionSnapshotQueryLive,
+  ).pipe(
     Layer.provide(OrchestrationEventStoreLive),
     Layer.provide(OrchestrationCommandReceiptRepositoryLive),
     Layer.provide(RepositoryIdentityResolverLive),
@@ -54,8 +57,10 @@ async function createOrchestrationSystem() {
   );
   const runtime = ManagedRuntime.make(orchestrationLayer);
   const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
+  const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
   return {
     engine,
+    readModel: () => runtime.runPromise(snapshotQuery.getSnapshot()),
     run: <A, E>(effect: Effect.Effect<A, E>) => runtime.runPromise(effect),
     dispose: () => runtime.dispose(),
   };
@@ -63,14 +68,6 @@ async function createOrchestrationSystem() {
 
 function now() {
   return new Date().toISOString();
-}
-
-function makePromiseGate<T = void>() {
-  let resolve!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>((next) => {
-    resolve = next;
-  });
-  return { promise, resolve };
 }
 
 const hasMetricSnapshot = (
@@ -85,15 +82,18 @@ const hasMetricSnapshot = (
   );
 
 describe("OrchestrationEngine", () => {
-  it("bootstraps the in-memory read model from persisted projections", async () => {
-    const failOnHistoricalReplayStore: OrchestrationEventStoreShape = {
-      append: () =>
-        Effect.fail(
-          new PersistenceSqlError({
-            operation: "test.append",
-            detail: "append should not be called during bootstrap",
-          }),
-        ),
+  it("bootstraps command handling from persisted projections without reading the full snapshot", async () => {
+    let nextSequence = 8;
+    const eventStore: OrchestrationEventStoreShape = {
+      append: (event) =>
+        Effect.sync(() => {
+          const savedEvent = {
+            ...event,
+            sequence: nextSequence,
+          } as OrchestrationEvent;
+          nextSequence += 1;
+          return savedEvent;
+        }),
       readFromSequence: () => Stream.empty,
       readAll: () =>
         Stream.fail(
@@ -193,7 +193,7 @@ describe("OrchestrationEngine", () => {
           projectEvent: () => Effect.void,
         } satisfies OrchestrationProjectionPipelineShape),
       ),
-      Layer.provide(Layer.succeed(OrchestrationEventStore, failOnHistoricalReplayStore)),
+      Layer.provide(Layer.succeed(OrchestrationEventStore, eventStore)),
       Layer.provide(OrchestrationCommandReceiptRepositoryLive),
       Layer.provide(SqlitePersistenceMemory),
     );
@@ -201,20 +201,22 @@ describe("OrchestrationEngine", () => {
     const runtime = ManagedRuntime.make(layer);
 
     const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
-    expect(fullSnapshotReadCount).toBe(0);
-    const readModel = await runtime.runPromise(engine.getReadModel());
+    const result = await runtime.runPromise(
+      engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-bootstrap-thread-update"),
+        threadId: ThreadId.make("thread-bootstrap"),
+        title: "Updated Bootstrap Thread",
+      }),
+    );
 
-    expect(fullSnapshotReadCount).toBe(1);
-    expect(readModel.snapshotSequence).toBe(7);
-    expect(readModel.projects).toHaveLength(1);
-    expect(readModel.projects[0]?.title).toBe("Bootstrap Project");
-    expect(readModel.threads).toHaveLength(1);
-    expect(readModel.threads[0]?.title).toBe("Bootstrap Thread");
+    expect(result.sequence).toBe(8);
+    expect(fullSnapshotReadCount).toBe(0);
 
     await runtime.dispose();
   });
 
-  it("returns deterministic read models for repeated reads", async () => {
+  it("persists deterministic read models for repeated snapshot reads", async () => {
     const createdAt = now();
     const system = await createOrchestrationSystem();
     const { engine } = system;
@@ -268,168 +270,10 @@ describe("OrchestrationEngine", () => {
       }),
     );
 
-    const readModelA = await system.run(engine.getReadModel());
-    const readModelB = await system.run(engine.getReadModel());
+    const readModelA = await system.readModel();
+    const readModelB = await system.readModel();
     expect(readModelB).toEqual(readModelA);
     await system.dispose();
-  });
-
-  it("does not publish full read model until hydration catches up", async () => {
-    const baseReadModel: OrchestrationReadModel = {
-      snapshotSequence: 1,
-      updatedAt: "2026-04-06T00:00:00.000Z",
-      projects: [
-        {
-          id: asProjectId("project-hydration-race"),
-          title: "Hydration Race Project",
-          workspaceRoot: "/tmp/project-hydration-race",
-          defaultModelSelection: {
-            provider: "codex",
-            model: "gpt-5-codex",
-          },
-          scripts: [],
-          createdAt: "2026-04-06T00:00:00.000Z",
-          updatedAt: "2026-04-06T00:00:00.000Z",
-          deletedAt: null,
-        },
-      ],
-      threads: [
-        {
-          id: ThreadId.make("thread-hydration-race"),
-          projectId: asProjectId("project-hydration-race"),
-          title: "before-hydration",
-          modelSelection: {
-            provider: "codex",
-            model: "gpt-5-codex",
-          },
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-          runtimeMode: "approval-required",
-          branch: null,
-          worktreePath: null,
-          latestTurn: null,
-          createdAt: "2026-04-06T00:00:00.000Z",
-          updatedAt: "2026-04-06T00:00:00.000Z",
-          archivedAt: null,
-          deletedAt: null,
-          messages: [],
-          proposedPlans: [],
-          activities: [],
-          checkpoints: [],
-          session: null,
-        },
-      ],
-    };
-
-    const events: OrchestrationEvent[] = [];
-    let nextSequence = 2;
-    const firstReadStarted = makePromiseGate();
-    const firstReadRelease = makePromiseGate();
-    const secondReadStarted = makePromiseGate();
-    const secondReadRelease = makePromiseGate();
-    let readCallCount = 0;
-
-    const eventStore: OrchestrationEventStoreShape = {
-      append: (event) =>
-        Effect.sync(() => {
-          const savedEvent = {
-            ...event,
-            sequence: nextSequence,
-          } as OrchestrationEvent;
-          nextSequence += 1;
-          events.push(savedEvent);
-          return savedEvent;
-        }),
-      readFromSequence: (sequenceExclusive) => {
-        readCallCount += 1;
-        const readCallIndex = readCallCount;
-        const capturedEvents = events.filter((event) => event.sequence > sequenceExclusive);
-
-        if (readCallIndex === 1) {
-          firstReadStarted.resolve();
-          return Stream.fromEffect(Effect.promise(() => firstReadRelease.promise)).pipe(
-            Stream.flatMap(() => Stream.fromIterable(capturedEvents)),
-          );
-        }
-
-        if (readCallIndex === 2) {
-          secondReadStarted.resolve();
-          return Stream.fromEffect(Effect.promise(() => secondReadRelease.promise)).pipe(
-            Stream.flatMap(() => Stream.fromIterable(capturedEvents)),
-          );
-        }
-
-        return Stream.fromIterable(capturedEvents);
-      },
-      readAll: () => Stream.fromIterable(events),
-    };
-
-    const runtime = ManagedRuntime.make(
-      OrchestrationEngineLive.pipe(
-        Layer.provide(
-          Layer.succeed(ProjectionSnapshotQuery, {
-            getCommandReadModel: () => Effect.succeed(baseReadModel),
-            getSnapshot: () => Effect.succeed(baseReadModel),
-            getShellSnapshot: () =>
-              Effect.succeed({
-                snapshotSequence: baseReadModel.snapshotSequence,
-                projects: [],
-                threads: [],
-                updatedAt: baseReadModel.updatedAt,
-              }),
-            getSnapshotSequence: () =>
-              Effect.succeed({ snapshotSequence: baseReadModel.snapshotSequence }),
-            getCounts: () => Effect.succeed({ projectCount: 1, threadCount: 1 }),
-            getActiveProjectByWorkspaceRoot: () => Effect.succeed(Option.none()),
-            getProjectShellById: () => Effect.succeed(Option.none()),
-            getFirstActiveThreadIdByProjectId: () => Effect.succeed(Option.none()),
-            getThreadCheckpointContext: () => Effect.succeed(Option.none()),
-            getThreadShellById: () => Effect.succeed(Option.none()),
-            getThreadDetailById: () => Effect.succeed(Option.none()),
-          }),
-        ),
-        Layer.provide(
-          Layer.succeed(OrchestrationProjectionPipeline, {
-            bootstrap: Effect.void,
-            projectEvent: () => Effect.void,
-          } satisfies OrchestrationProjectionPipelineShape),
-        ),
-        Layer.provide(Layer.succeed(OrchestrationEventStore, eventStore)),
-        Layer.provide(OrchestrationCommandReceiptRepositoryLive),
-        Layer.provide(SqlitePersistenceMemory),
-      ),
-    );
-    const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
-
-    const readModelPromise = runtime.runPromise(engine.getReadModel());
-    await firstReadStarted.promise;
-
-    await runtime.runPromise(
-      engine.dispatch({
-        type: "thread.meta.update",
-        commandId: CommandId.make("cmd-hydration-race-1"),
-        threadId: ThreadId.make("thread-hydration-race"),
-        title: "after-first-dispatch",
-      }),
-    );
-
-    firstReadRelease.resolve();
-    await secondReadStarted.promise;
-
-    await runtime.runPromise(
-      engine.dispatch({
-        type: "thread.meta.update",
-        commandId: CommandId.make("cmd-hydration-race-2"),
-        threadId: ThreadId.make("thread-hydration-race"),
-        title: "after-second-dispatch",
-      }),
-    );
-
-    secondReadRelease.resolve();
-    const readModel = await readModelPromise;
-    expect(readModel.snapshotSequence).toBe(3);
-    expect(readModel.threads[0]?.title).toBe("after-second-dispatch");
-
-    await runtime.dispose();
   });
 
   it("archives and unarchives threads through orchestration commands", async () => {
@@ -478,9 +322,8 @@ describe("OrchestrationEngine", () => {
       }),
     );
     expect(
-      (await system.run(engine.getReadModel())).threads.find(
-        (thread) => thread.id === "thread-archive",
-      )?.archivedAt,
+      (await system.readModel()).threads.find((thread) => thread.id === "thread-archive")
+        ?.archivedAt,
     ).not.toBeNull();
 
     await system.run(
@@ -491,9 +334,8 @@ describe("OrchestrationEngine", () => {
       }),
     );
     expect(
-      (await system.run(engine.getReadModel())).threads.find(
-        (thread) => thread.id === "thread-archive",
-      )?.archivedAt,
+      (await system.readModel()).threads.find((thread) => thread.id === "thread-archive")
+        ?.archivedAt,
     ).toBeNull();
 
     await system.dispose();
@@ -759,7 +601,7 @@ describe("OrchestrationEngine", () => {
       }),
     );
 
-    const thread = (await system.run(engine.getReadModel())).threads.find(
+    const thread = (await system.readModel()).threads.find(
       (entry) => entry.id === "thread-turn-diff",
     );
     expect(thread?.checkpoints).toEqual([
@@ -887,7 +729,15 @@ describe("OrchestrationEngine", () => {
     );
 
     expect(result.sequence).toBe(2);
-    expect((await runtime.runPromise(engine.getReadModel())).snapshotSequence).toBe(2);
+    const eventsAfterRetry = await runtime.runPromise(
+      Stream.runCollect(engine.readEvents(0)).pipe(
+        Effect.map((chunk): OrchestrationEvent[] => Array.from(chunk)),
+      ),
+    );
+    expect(eventsAfterRetry.map((event) => event.type)).toEqual([
+      "project.created",
+      "thread.created",
+    ]);
     await runtime.dispose();
   });
 
@@ -987,7 +837,6 @@ describe("OrchestrationEngine", () => {
       "project.created",
       "thread.created",
     ]);
-    expect((await runtime.runPromise(engine.getReadModel())).snapshotSequence).toBe(2);
 
     const retryResult = await runtime.runPromise(engine.dispatch(turnStartCommand));
     expect(retryResult.sequence).toBe(4);
@@ -1010,7 +859,7 @@ describe("OrchestrationEngine", () => {
     await runtime.dispose();
   });
 
-  it("reconciles in-memory state when append persists but projection fails", async () => {
+  it("reconciles command state when append persists but projection fails", async () => {
     type StoredEvent =
       ReturnType<OrchestrationEventStoreShape["append"]> extends Effect.Effect<infer A, any, any>
         ? A
@@ -1042,7 +891,7 @@ describe("OrchestrationEngine", () => {
       projectEvent: (event) => {
         if (
           shouldFailProjection &&
-          event.commandId === CommandId.make("cmd-thread-meta-sync-fail")
+          event.commandId === CommandId.make("cmd-thread-archive-sync-fail")
         ) {
           shouldFailProjection = false;
           return Effect.fail(
@@ -1105,20 +954,22 @@ describe("OrchestrationEngine", () => {
     await expect(
       runtime.runPromise(
         engine.dispatch({
-          type: "thread.meta.update",
-          commandId: CommandId.make("cmd-thread-meta-sync-fail"),
+          type: "thread.archive",
+          commandId: CommandId.make("cmd-thread-archive-sync-fail"),
           threadId: ThreadId.make("thread-sync"),
-          title: "sync-after-failed-projection",
         }),
       ),
     ).rejects.toThrow("projection failed");
 
-    const readModelAfterFailure = await runtime.runPromise(engine.getReadModel());
-    const updatedThread = readModelAfterFailure.threads.find(
-      (thread) => thread.id === "thread-sync",
-    );
-    expect(readModelAfterFailure.snapshotSequence).toBe(3);
-    expect(updatedThread?.title).toBe("sync-after-failed-projection");
+    await expect(
+      runtime.runPromise(
+        engine.dispatch({
+          type: "thread.archive",
+          commandId: CommandId.make("cmd-thread-archive-sync-retry"),
+          threadId: ThreadId.make("thread-sync"),
+        }),
+      ),
+    ).rejects.toThrow("already archived");
 
     await runtime.dispose();
   });
