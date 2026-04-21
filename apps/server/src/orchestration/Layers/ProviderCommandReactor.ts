@@ -722,20 +722,16 @@ const make = Effect.gen(function* () {
       })
       .pipe(
         Effect.catchCause((cause) =>
-          Effect.gen(function* () {
-            yield* appendProviderFailureActivity({
-              threadId: event.payload.threadId,
-              kind: "provider.approval.respond.failed",
-              summary: "Provider approval response failed",
-              detail: isUnknownPendingApprovalRequestError(cause)
-                ? stalePendingRequestDetail("approval", event.payload.requestId)
-                : Cause.pretty(cause),
-              turnId: null,
-              createdAt: event.payload.createdAt,
-              requestId: event.payload.requestId,
-            });
-
-            if (!isUnknownPendingApprovalRequestError(cause)) return;
+          appendProviderFailureActivity({
+            threadId: event.payload.threadId,
+            kind: "provider.approval.respond.failed",
+            summary: "Provider approval response failed",
+            detail: isUnknownPendingApprovalRequestError(cause)
+              ? stalePendingRequestDetail("approval", event.payload.requestId)
+              : Cause.pretty(cause),
+            turnId: null,
+            createdAt: event.payload.createdAt,
+            requestId: event.payload.requestId,
           }),
         ),
       );
