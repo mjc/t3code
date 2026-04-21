@@ -17,7 +17,6 @@ import {
   PubSub,
   Queue,
   Schema,
-  Semaphore,
   Stream,
 } from "effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -79,11 +78,9 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
 
   let commandReadModel = createEmptyReadModel(new Date().toISOString());
-  let fullReadModel: OrchestrationReadModel | null = null;
 
   const commandQueue = yield* Queue.unbounded<CommandEnvelope>();
   const eventPubSub = yield* PubSub.unbounded<OrchestrationEvent>();
-  const fullReadModelHydrationSemaphore = yield* Semaphore.make(1);
 
   const projectEventsOntoReadModel = (
     baseReadModel: OrchestrationReadModel,
@@ -96,55 +93,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       }
       return nextReadModel;
     });
-
-  const reconcileHydratedReadModel = (
-    baseReadModel: OrchestrationReadModel,
-  ): Effect.Effect<OrchestrationReadModel, never, never> =>
-    Effect.gen(function* () {
-      const persistedEvents = yield* Stream.runCollect(
-        eventStore.readFromSequence(baseReadModel.snapshotSequence),
-      ).pipe(
-        Effect.map((chunk): OrchestrationEvent[] => Array.from(chunk)),
-        Effect.orDie,
-      );
-      if (persistedEvents.length === 0) {
-        return baseReadModel;
-      }
-
-      return yield* projectEventsOntoReadModel(baseReadModel, persistedEvents);
-    });
-
-  const hydrateFullReadModel = (): Effect.Effect<OrchestrationReadModel, never, never> => {
-    if (fullReadModel !== null) {
-      return Effect.succeed(fullReadModel);
-    }
-
-    return fullReadModelHydrationSemaphore.withPermit(
-      Effect.gen(function* () {
-        if (fullReadModel !== null) {
-          return fullReadModel;
-        }
-
-        let nextFullReadModel = yield* projectionSnapshotQuery.getSnapshot().pipe(Effect.orDie);
-        nextFullReadModel = yield* reconcileHydratedReadModel(nextFullReadModel);
-
-        while (nextFullReadModel.snapshotSequence < commandReadModel.snapshotSequence) {
-          const previousSequence = nextFullReadModel.snapshotSequence;
-          nextFullReadModel = yield* reconcileHydratedReadModel(nextFullReadModel);
-          if (nextFullReadModel.snapshotSequence === previousSequence) {
-            return yield* Effect.die(
-              new Error(
-                `Unable to hydrate orchestration read model to command sequence ${commandReadModel.snapshotSequence}; stuck at sequence ${nextFullReadModel.snapshotSequence}.`,
-              ),
-            );
-          }
-        }
-
-        fullReadModel = nextFullReadModel;
-        return nextFullReadModel;
-      }),
-    );
-  };
 
   const processEnvelope = (envelope: CommandEnvelope): Effect.Effect<void> => {
     const dispatchStartSequence = commandReadModel.snapshotSequence;
@@ -163,9 +111,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
       }
 
       commandReadModel = yield* projectEventsOntoReadModel(commandReadModel, persistedEvents);
-      if (fullReadModel !== null) {
-        fullReadModel = yield* projectEventsOntoReadModel(fullReadModel, persistedEvents);
-      }
 
       for (const persistedEvent of persistedEvents) {
         yield* PubSub.publish(eventPubSub, persistedEvent);
@@ -248,12 +193,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
           );
 
         commandReadModel = committedCommand.nextCommandReadModel;
-        if (fullReadModel !== null) {
-          fullReadModel = yield* projectEventsOntoReadModel(
-            fullReadModel,
-            committedCommand.committedEvents,
-          );
-        }
         for (const [index, event] of committedCommand.committedEvents.entries()) {
           yield* PubSub.publish(eventPubSub, event);
           if (index === 0) {
@@ -347,8 +286,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     Effect.annotateLogs({ sequence: commandReadModel.snapshotSequence }),
   );
 
-  const getReadModel: OrchestrationEngineShape["getReadModel"] = () => hydrateFullReadModel();
-
   const readEvents: OrchestrationEngineShape["readEvents"] = (fromSequenceExclusive) =>
     eventStore.readFromSequence(fromSequenceExclusive);
 
@@ -360,7 +297,6 @@ const makeOrchestrationEngine = Effect.gen(function* () {
     });
 
   return {
-    getReadModel,
     readEvents,
     dispatch,
     // Each access creates a fresh PubSub subscription so that multiple
