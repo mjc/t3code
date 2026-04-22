@@ -133,6 +133,8 @@ interface CopilotSessionContext {
   readonly toolMetaById: Map<string, ToolMeta>;
   readonly turnIdByProviderItemId: Map<string, TurnId>;
   readonly emittedTextByItemId: Map<string, string>;
+  readonly pendingTaskCompletionTextByTurnId: Map<TurnId, string>;
+  readonly turnIdsWithAssistantText: Set<TurnId>;
   readonly startedItemIds: Set<string>;
   activeTurnId: TurnId | undefined;
   activeSdkTurnId: string | undefined;
@@ -453,6 +455,10 @@ function toolItemType(toolName: string, mcpServerName?: string): ToolMeta["itemT
     return "collab_agent_tool_call";
   }
   return "dynamic_tool_call";
+}
+
+function isTaskCompleteTool(toolName: string | undefined): boolean {
+  return toolName?.toLowerCase().replace(/[\s_-]+/g, "") === "taskcomplete";
 }
 
 function toolStreamKind(
@@ -835,9 +841,13 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
         },
       ) => {
         if (context.completedTurnIds.has(turnId)) {
+          context.pendingTaskCompletionTextByTurnId.delete(turnId);
+          context.turnIdsWithAssistantText.delete(turnId);
           return;
         }
         context.completedTurnIds.add(turnId);
+        context.pendingTaskCompletionTextByTurnId.delete(turnId);
+        context.turnIdsWithAssistantText.delete(turnId);
         if (context.activeTurnId === turnId) {
           context.activeTurnId = undefined;
         }
@@ -896,6 +906,9 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
         if (delta.length === 0) {
           return;
         }
+        if (input.itemType === "assistant_message" && input.streamKind === "assistant_text") {
+          input.context.turnIdsWithAssistantText.add(input.turnId);
+        }
         await emitAsync({
           ...createBaseEvent({
             threadId: input.context.threadId,
@@ -908,6 +921,39 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             streamKind: input.streamKind,
             delta,
           },
+        });
+      };
+
+      const emitPendingTaskCompletionAsAssistantMessage = async (
+        context: CopilotSessionContext,
+        turnId: TurnId,
+        raw: SessionEvent,
+      ) => {
+        const content = context.pendingTaskCompletionTextByTurnId.get(turnId);
+        if (!content || context.turnIdsWithAssistantText.has(turnId)) {
+          return;
+        }
+
+        context.pendingTaskCompletionTextByTurnId.delete(turnId);
+        const itemId = `copilot-task-completion-${String(turnId)}`;
+        await emitAsync({
+          ...createBaseEvent({
+            threadId: context.threadId,
+            turnId,
+            itemId,
+            raw,
+          }),
+          type: "item.completed",
+          payload: {
+            itemType: "assistant_message",
+            status: "completed",
+            detail: content,
+          },
+        });
+        appendTurnItem(context, turnId, {
+          type: "assistant_message",
+          messageId: itemId,
+          content,
         });
       };
 
@@ -1304,6 +1350,13 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           }
           case "session.idle": {
             if (context.activeTurnId) {
+              if (!event.data.aborted) {
+                await emitPendingTaskCompletionAsAssistantMessage(
+                  context,
+                  context.activeTurnId,
+                  event,
+                );
+              }
               await emitTurnCompleted(
                 context,
                 context.activeTurnId,
@@ -1588,6 +1641,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             if (!turnId) {
               return;
             }
+            await emitPendingTaskCompletionAsAssistantMessage(context, turnId, event);
             await emitTurnCompleted(context, turnId, "completed", {
               raw: event,
               stopReason: null,
@@ -1771,6 +1825,9 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
               success: event.data.success,
               detail,
             });
+            if (event.data.success && detail && isTaskCompleteTool(toolMeta?.toolName)) {
+              context.pendingTaskCompletionTextByTurnId.set(turnId, detail);
+            }
             return;
           }
           case "permission.requested": {
@@ -1994,6 +2051,8 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             toolMetaById: new Map(),
             turnIdByProviderItemId: new Map(),
             emittedTextByItemId: new Map(),
+            pendingTaskCompletionTextByTurnId: new Map(),
+            turnIdsWithAssistantText: new Set(),
             startedItemIds: new Set(),
             activeTurnId: undefined,
             activeSdkTurnId: undefined,
