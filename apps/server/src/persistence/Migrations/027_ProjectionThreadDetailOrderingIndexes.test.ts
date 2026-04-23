@@ -26,9 +26,7 @@ layer("027_ProjectionThreadDetailOrderingIndexes", (it) => {
       `;
       assert.ok(
         activityIndexes.some(
-          (index) =>
-            index.name ===
-            "idx_projection_thread_activities_thread_sequence_created_id",
+          (index) => index.name === "idx_projection_thread_activities_thread_sequence_created_id",
         ),
       );
 
@@ -55,8 +53,7 @@ layer("027_ProjectionThreadDetailOrderingIndexes", (it) => {
       `;
       assert.ok(
         messageIndexes.some(
-          (index) =>
-            index.name === "idx_projection_thread_messages_thread_created_id",
+          (index) => index.name === "idx_projection_thread_messages_thread_created_id",
         ),
       );
 
