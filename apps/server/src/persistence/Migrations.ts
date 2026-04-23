@@ -38,7 +38,8 @@ import Migration0022 from "./Migrations/022_AuthSessionLastConnectedAt.ts";
 import Migration0023 from "./Migrations/023_ProjectionThreadShellSummary.ts";
 import Migration0024 from "./Migrations/024_BackfillProjectionThreadShellSummary.ts";
 import Migration0025 from "./Migrations/025_CleanupInvalidProjectionPendingApprovals.ts";
-import Migration0026 from "./Migrations/026_ProjectionThreadDetailOrderingIndexes.ts";
+import Migration0026 from "./Migrations/026_CanonicalizeModelSelectionOptions.ts";
+import Migration0027 from "./Migrations/027_ProjectionThreadDetailOrderingIndexes.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -76,7 +77,8 @@ export const migrationEntries = [
   [23, "ProjectionThreadShellSummary", Migration0023],
   [24, "BackfillProjectionThreadShellSummary", Migration0024],
   [25, "CleanupInvalidProjectionPendingApprovals", Migration0025],
-  [26, "ProjectionThreadDetailOrderingIndexes", Migration0026],
+  [26, "CanonicalizeModelSelectionOptions", Migration0026],
+  [27, "ProjectionThreadDetailOrderingIndexes", Migration0027],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>
@@ -116,9 +118,13 @@ export const runMigrations = Effect.fn("runMigrations")(function* ({
       ? "Running all migrations..."
       : `Running migrations 1 through ${toMigrationInclusive}...`,
   );
-  const executedMigrations = yield* run({ loader: makeMigrationLoader(toMigrationInclusive) });
+  const executedMigrations = yield* run({
+    loader: makeMigrationLoader(toMigrationInclusive),
+  });
   yield* Effect.log("Migrations ran successfully").pipe(
-    Effect.annotateLogs({ migrations: executedMigrations.map(([id, name]) => `${id}_${name}`) }),
+    Effect.annotateLogs({
+      migrations: executedMigrations.map(([id, name]) => `${id}_${name}`),
+    }),
   );
   return executedMigrations;
 });
