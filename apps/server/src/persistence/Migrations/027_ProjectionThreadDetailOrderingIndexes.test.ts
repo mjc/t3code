@@ -7,13 +7,13 @@ import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
-layer("026_ProjectionThreadDetailOrderingIndexes", (it) => {
+layer("027_ProjectionThreadDetailOrderingIndexes", (it) => {
   it.effect("creates indexes matching thread detail ordering queries", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 25 });
       yield* runMigrations({ toMigrationInclusive: 26 });
+      yield* runMigrations({ toMigrationInclusive: 27 });
 
       const activityIndexes = yield* sql<{
         readonly seq: number;
@@ -26,7 +26,9 @@ layer("026_ProjectionThreadDetailOrderingIndexes", (it) => {
       `;
       assert.ok(
         activityIndexes.some(
-          (index) => index.name === "idx_projection_thread_activities_thread_sequence_created_id",
+          (index) =>
+            index.name ===
+            "idx_projection_thread_activities_thread_sequence_created_id",
         ),
       );
 
@@ -53,7 +55,8 @@ layer("026_ProjectionThreadDetailOrderingIndexes", (it) => {
       `;
       assert.ok(
         messageIndexes.some(
-          (index) => index.name === "idx_projection_thread_messages_thread_created_id",
+          (index) =>
+            index.name === "idx_projection_thread_messages_thread_created_id",
         ),
       );
 
