@@ -1084,7 +1084,9 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         createdAt: new Date().toISOString(),
         threadId: session.threadId,
         turnId: asTurnId("turn-1"),
-        status: "completed",
+        payload: {
+          state: "completed",
+        },
       };
 
       fanout.codex.emit(completedEvent);
@@ -1143,7 +1145,9 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
         createdAt: new Date().toISOString(),
         threadId: session.threadId,
         turnId: asTurnId("turn-1"),
-        status: "completed",
+        payload: {
+          state: "completed",
+        },
       });
 
       yield* Fiber.join(consumer);
@@ -1208,7 +1212,9 @@ fanout.layer("ProviderServiceLive fanout", (it) => {
           createdAt: new Date().toISOString(),
           threadId: session.threadId,
           turnId: asTurnId("turn-1"),
-          status: "completed",
+          payload: {
+            state: "completed",
+          },
         },
       ];
 

@@ -189,11 +189,102 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const providers = yield* registry.listProviders();
   const adapters = yield* Effect.forEach(providers, (provider) => registry.getByProvider(provider));
+  const syncRuntimeBindingFromEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> => {
+    const runtimePayload: Record<string, unknown> = {
+      lastRuntimeEvent: event.type,
+      lastRuntimeEventAt: event.createdAt,
+    };
+    let status: ProviderRuntimeBinding["status"] | undefined;
+
+    switch (event.type) {
+      case "session.started":
+      case "thread.started": {
+        status = "running";
+        break;
+      }
+      case "session.state.changed": {
+        switch (event.payload.state) {
+          case "starting":
+            status = "starting";
+            break;
+          case "stopped":
+            status = "stopped";
+            runtimePayload.activeTurnId = null;
+            break;
+          case "error":
+            status = "error";
+            runtimePayload.lastError = event.payload.reason ?? null;
+            break;
+          case "ready":
+          case "running":
+          case "waiting":
+          default:
+            status = "running";
+            if (event.payload.state === "ready") {
+              runtimePayload.activeTurnId = null;
+              runtimePayload.lastError = null;
+            }
+            break;
+        }
+        break;
+      }
+      case "turn.started": {
+        status = "running";
+        runtimePayload.activeTurnId = event.turnId ?? null;
+        runtimePayload.lastError = null;
+        break;
+      }
+      case "turn.completed": {
+        status = "running";
+        runtimePayload.activeTurnId = null;
+        runtimePayload.lastError =
+          event.payload.state === "failed" ? (event.payload.errorMessage ?? null) : null;
+        break;
+      }
+      case "session.exited": {
+        status = "stopped";
+        runtimePayload.activeTurnId = null;
+        runtimePayload.lastError = event.payload.reason ?? null;
+        break;
+      }
+      case "runtime.error": {
+        status = "error";
+        runtimePayload.lastError = event.payload.message;
+        if (event.turnId !== undefined) {
+          runtimePayload.activeTurnId = event.turnId;
+        }
+        break;
+      }
+      default:
+        break;
+    }
+
+    return directory
+      .upsert({
+        threadId: event.threadId,
+        provider: event.provider,
+        ...(status !== undefined ? { status } : {}),
+        runtimePayload,
+      })
+      .pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("provider.runtime.binding-sync-failed", {
+            threadId: event.threadId,
+            provider: event.provider,
+            eventType: event.type,
+            cause,
+          }),
+        ),
+      );
+  };
   const processRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
     increment(providerRuntimeEventsTotal, {
       provider: event.provider,
       eventType: event.type,
-    }).pipe(Effect.andThen(publishRuntimeEvent(event)));
+    }).pipe(
+      Effect.andThen(syncRuntimeBindingFromEvent(event)),
+      Effect.andThen(publishRuntimeEvent(event)),
+    );
 
   yield* Effect.forEach(adapters, (adapter) =>
     Stream.runForEach(adapter.streamEvents, processRuntimeEvent).pipe(Effect.forkScoped),

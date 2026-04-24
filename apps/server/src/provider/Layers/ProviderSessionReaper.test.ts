@@ -1,9 +1,16 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { ProjectId, ThreadId, TurnId } from "@t3tools/contracts";
+import {
+  MessageId,
+  ProjectId,
+  ThreadId,
+  TurnId,
+  type OrchestrationReadModel,
+} from "@t3tools/contracts";
 import { Effect, Exit, Layer, ManagedRuntime, Option, Scope, Stream } from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { ServerConfig } from "../../config.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import { ProviderSessionRuntimeRepositoryLive } from "../../persistence/Layers/ProviderSessionRuntime.ts";
 import { ProviderSessionRuntimeRepository } from "../../persistence/Services/ProviderSessionRuntime.ts";
@@ -42,6 +49,14 @@ const unsupported = () => Effect.die(new Error("Unsupported provider call in tes
 function makeReadModel(
   threads: ReadonlyArray<{
     readonly id: ThreadId;
+    readonly latestTurn?: {
+      readonly turnId: TurnId;
+      readonly state: "running" | "completed" | "interrupted" | "error";
+      readonly requestedAt: string;
+      readonly startedAt: string | null;
+      readonly completedAt: string | null;
+      readonly assistantMessageId: MessageId | null;
+    } | null;
     readonly session: {
       readonly threadId: ThreadId;
       readonly status: "starting" | "running" | "ready" | "interrupted" | "stopped" | "error";
@@ -87,7 +102,7 @@ function makeReadModel(
       hasPendingApprovals: false,
       hasPendingUserInput: false,
       hasActionableProposedPlan: false,
-      latestTurn: null,
+      latestTurn: thread.latestTurn ?? null,
       messages: [],
       session: thread.session,
       activities: [],
@@ -95,7 +110,7 @@ function makeReadModel(
       checkpoints: [],
       deletedAt: null,
     })),
-  };
+  } satisfies OrchestrationReadModel;
 }
 
 describe("ProviderSessionReaper", () => {
@@ -179,6 +194,7 @@ describe("ProviderSessionReaper", () => {
           getThreadDetailById: () => Effect.die("unused"),
         }),
       ),
+      Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
       Layer.provideMerge(NodeServices.layer),
     );
 
@@ -277,6 +293,60 @@ describe("ProviderSessionReaper", () => {
     expect(harness.stopSession).not.toHaveBeenCalled();
     const remaining = await runtime!.runPromise(repository.getByThreadId({ threadId }));
     expect(Option.isSome(remaining)).toBe(true);
+  });
+
+  it("reaps stale sessions when the projected active turn is already completed", async () => {
+    const threadId = ThreadId.make("thread-reaper-stale-projected-turn");
+    const turnId = TurnId.make("turn-reaper-completed");
+    const now = new Date().toISOString();
+    const harness = await createHarness({
+      readModel: makeReadModel([
+        {
+          id: threadId,
+          latestTurn: {
+            turnId,
+            state: "completed",
+            requestedAt: "2026-04-14T00:00:00.000Z",
+            startedAt: "2026-04-14T00:00:01.000Z",
+            completedAt: "2026-04-14T00:00:30.000Z",
+            assistantMessageId: null,
+          },
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "claudeAgent",
+            runtimeMode: "full-access",
+            activeTurnId: turnId,
+            lastError: null,
+            updatedAt: now,
+          },
+        },
+      ]),
+    });
+    const repository = await runtime!.runPromise(Effect.service(ProviderSessionRuntimeRepository));
+
+    await runtime!.runPromise(
+      repository.upsert({
+        threadId,
+        providerName: "claudeAgent",
+        adapterKey: "claudeAgent",
+        runtimeMode: "full-access",
+        status: "running",
+        lastSeenAt: "2026-04-14T00:00:00.000Z",
+        resumeCursor: {
+          opaque: "resume-completed-turn",
+        },
+        runtimePayload: null,
+      }),
+    );
+
+    const reaper = await runtime!.runPromise(Effect.service(ProviderSessionReaper));
+    scope = await Effect.runPromise(Scope.make("sequential"));
+    await Effect.runPromise(reaper.start().pipe(Scope.provide(scope)));
+
+    await waitFor(() => harness.stopSession.mock.calls.length === 1);
+
+    expect(harness.stopSession.mock.calls[0]?.[0]).toEqual({ threadId });
   });
 
   it("does not reap sessions that are still within the inactivity threshold", async () => {

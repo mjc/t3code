@@ -1,5 +1,7 @@
+import { type OrchestrationReadModel } from "@t3tools/contracts";
 import { Duration, Effect, Layer, Option, Schedule } from "effect";
 
+import { ServerConfig } from "../../config.ts";
 import { ProjectionSnapshotQuery } from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import {
@@ -11,6 +13,25 @@ import { ProviderService } from "../Services/ProviderService.ts";
 const DEFAULT_INACTIVITY_THRESHOLD_MS = 30 * 60 * 1000;
 const DEFAULT_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 
+type ReaperThread = Pick<OrchestrationReadModel["threads"][number], "latestTurn" | "session">;
+
+const hasUnresolvedActiveTurn = (thread: ReaperThread | undefined): boolean => {
+  const activeTurnId = thread?.session?.activeTurnId;
+  if (activeTurnId == null) {
+    return false;
+  }
+  if (thread === undefined) {
+    return false;
+  }
+
+  const latestTurn = thread.latestTurn;
+  if (latestTurn?.turnId === activeTurnId) {
+    return latestTurn.state === "running";
+  }
+
+  return thread.session?.status === "running";
+};
+
 export interface ProviderSessionReaperLiveOptions {
   readonly inactivityThresholdMs?: number;
   readonly sweepIntervalMs?: number;
@@ -18,6 +39,7 @@ export interface ProviderSessionReaperLiveOptions {
 
 const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =>
   Effect.gen(function* () {
+    const serverConfig = yield* ServerConfig;
     const providerService = yield* ProviderService;
     const directory = yield* ProviderSessionDirectory;
     const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
@@ -56,10 +78,12 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
         const thread = yield* projectionSnapshotQuery
           .getThreadShellById(binding.threadId)
           .pipe(Effect.map(Option.getOrUndefined));
-        if (thread?.session?.activeTurnId != null) {
+        if (hasUnresolvedActiveTurn(thread)) {
           yield* Effect.logDebug("provider.session.reaper.skipped-active-turn", {
             threadId: binding.threadId,
-            activeTurnId: thread.session.activeTurnId,
+            activeTurnId: thread?.session?.activeTurnId ?? null,
+            sessionStatus: thread?.session?.status ?? null,
+            latestTurnState: thread?.latestTurn?.state ?? null,
             idleDurationMs,
           });
           continue;
@@ -117,6 +141,7 @@ const makeProviderSessionReaper = (options?: ProviderSessionReaperLiveOptions) =
         );
 
         yield* Effect.logInfo("provider.session.reaper.started", {
+          mode: serverConfig.mode,
           inactivityThresholdMs,
           sweepIntervalMs,
         });
