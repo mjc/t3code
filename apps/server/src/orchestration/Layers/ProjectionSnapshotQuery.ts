@@ -322,23 +322,27 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       `,
   });
 
-  const listThreadMessageRows = SqlSchema.findAll({
+  const listActiveThreadMessageRows = SqlSchema.findAll({
     Request: Schema.Void,
     Result: ProjectionThreadMessageDbRowSchema,
     execute: () =>
       sql`
         SELECT
-          message_id AS "messageId",
-          thread_id AS "threadId",
-          turn_id AS "turnId",
-          role,
-          text,
-          attachments_json AS "attachments",
-          is_streaming AS "isStreaming",
-          created_at AS "createdAt",
-          updated_at AS "updatedAt"
-        FROM projection_thread_messages
-        ORDER BY thread_id ASC, created_at ASC, message_id ASC
+          messages.message_id AS "messageId",
+          messages.thread_id AS "threadId",
+          messages.turn_id AS "turnId",
+          messages.role,
+          messages.text,
+          messages.attachments_json AS "attachments",
+          messages.is_streaming AS "isStreaming",
+          messages.created_at AS "createdAt",
+          messages.updated_at AS "updatedAt"
+        FROM projection_thread_messages AS messages
+        INNER JOIN projection_threads AS threads
+          ON threads.thread_id = messages.thread_id
+        WHERE threads.deleted_at IS NULL
+          AND threads.archived_at IS NULL
+        ORDER BY messages.thread_id ASC, messages.created_at ASC, messages.message_id ASC
       `,
   });
 
@@ -361,27 +365,73 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       `,
   });
 
-  const listThreadActivityRows = SqlSchema.findAll({
+  const listActiveThreadProposedPlanRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionThreadProposedPlanDbRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          plans.plan_id AS "planId",
+          plans.thread_id AS "threadId",
+          plans.turn_id AS "turnId",
+          plans.plan_markdown AS "planMarkdown",
+          plans.implemented_at AS "implementedAt",
+          plans.implementation_thread_id AS "implementationThreadId",
+          plans.created_at AS "createdAt",
+          plans.updated_at AS "updatedAt"
+        FROM projection_thread_proposed_plans AS plans
+        INNER JOIN projection_threads AS threads
+          ON threads.thread_id = plans.thread_id
+        WHERE threads.deleted_at IS NULL
+          AND threads.archived_at IS NULL
+        ORDER BY plans.thread_id ASC, plans.created_at ASC, plans.plan_id ASC
+      `,
+  });
+
+  const listResumableThreadActivityRows = SqlSchema.findAll({
     Request: Schema.Void,
     Result: ProjectionThreadActivityDbRowSchema,
     execute: () =>
       sql`
         SELECT
-          activity_id AS "activityId",
-          thread_id AS "threadId",
-          turn_id AS "turnId",
-          tone,
-          kind,
-          summary,
-          payload_json AS "payload",
-          sequence,
-          created_at AS "createdAt"
-        FROM projection_thread_activities
+          activities.activity_id AS "activityId",
+          activities.thread_id AS "threadId",
+          activities.turn_id AS "turnId",
+          activities.tone,
+          activities.kind,
+          activities.summary,
+          activities.payload_json AS "payload",
+          activities.sequence,
+          activities.created_at AS "createdAt"
+        FROM projection_thread_activities AS activities
+        INNER JOIN projection_threads AS threads
+          ON threads.thread_id = activities.thread_id
+        WHERE threads.deleted_at IS NULL
+          AND threads.archived_at IS NULL
+          AND (
+            EXISTS (
+              SELECT 1
+              FROM projection_thread_sessions AS sessions
+              WHERE sessions.thread_id = threads.thread_id
+                AND (
+                  sessions.status <> 'stopped'
+                  OR sessions.active_turn_id IS NOT NULL
+                )
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM projection_turns AS turns
+              WHERE turns.thread_id = threads.thread_id
+                AND turns.turn_id = threads.latest_turn_id
+                AND turns.state IN ('pending', 'running')
+            )
+          )
         ORDER BY
-          thread_id ASC,
-          sequence ASC,
-          created_at ASC,
-          activity_id ASC
+          activities.thread_id ASC,
+          CASE WHEN activities.sequence IS NULL THEN 0 ELSE 1 END ASC,
+          activities.sequence ASC,
+          activities.created_at ASC,
+          activities.activity_id ASC
       `,
   });
 
@@ -405,23 +455,27 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       `,
   });
 
-  const listCheckpointRows = SqlSchema.findAll({
+  const listActiveCheckpointRows = SqlSchema.findAll({
     Request: Schema.Void,
     Result: ProjectionCheckpointDbRowSchema,
     execute: () =>
       sql`
         SELECT
-          thread_id AS "threadId",
-          turn_id AS "turnId",
-          checkpoint_turn_count AS "checkpointTurnCount",
-          checkpoint_ref AS "checkpointRef",
-          checkpoint_status AS "status",
-          checkpoint_files_json AS "files",
-          assistant_message_id AS "assistantMessageId",
-          completed_at AS "completedAt"
-        FROM projection_turns
-        WHERE checkpoint_turn_count IS NOT NULL
-        ORDER BY thread_id ASC, checkpoint_turn_count ASC
+          turns.thread_id AS "threadId",
+          turns.turn_id AS "turnId",
+          turns.checkpoint_turn_count AS "checkpointTurnCount",
+          turns.checkpoint_ref AS "checkpointRef",
+          turns.checkpoint_status AS "status",
+          turns.checkpoint_files_json AS "files",
+          turns.assistant_message_id AS "assistantMessageId",
+          turns.completed_at AS "completedAt"
+        FROM projection_turns AS turns
+        INNER JOIN projection_threads AS threads
+          ON threads.thread_id = turns.thread_id
+        WHERE turns.checkpoint_turn_count IS NOT NULL
+          AND threads.deleted_at IS NULL
+          AND threads.archived_at IS NULL
+        ORDER BY turns.thread_id ASC, turns.checkpoint_turn_count ASC
       `,
   });
 
@@ -755,7 +809,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               ),
             ),
           ),
-          listThreadMessageRows(undefined).pipe(
+          listActiveThreadMessageRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
                 "ProjectionSnapshotQuery.getSnapshot:listThreadMessages:query",
@@ -763,7 +817,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               ),
             ),
           ),
-          listThreadProposedPlanRows(undefined).pipe(
+          listActiveThreadProposedPlanRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
                 "ProjectionSnapshotQuery.getSnapshot:listThreadProposedPlans:query",
@@ -771,7 +825,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               ),
             ),
           ),
-          listThreadActivityRows(undefined).pipe(
+          listResumableThreadActivityRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
                 "ProjectionSnapshotQuery.getSnapshot:listThreadActivities:query",
@@ -787,7 +841,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               ),
             ),
           ),
-          listCheckpointRows(undefined).pipe(
+          listActiveCheckpointRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
                 "ProjectionSnapshotQuery.getSnapshot:listCheckpoints:query",
