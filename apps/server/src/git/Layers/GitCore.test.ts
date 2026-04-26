@@ -187,7 +187,7 @@ it.layer(TestLayer)("git integration", (it) => {
     it.effect("caps captured output when maxOutputBytes is exceeded", () =>
       Effect.gen(function* () {
         const result = yield* runShellCommand({
-          command: `node -e "process.stdout.write('x'.repeat(2000))"`,
+          command: `${JSON.stringify(process.execPath)} -e "process.stdout.write('x'.repeat(2000))"`,
           cwd: process.cwd(),
           timeoutMs: 10_000,
           maxOutputBytes: 128,
