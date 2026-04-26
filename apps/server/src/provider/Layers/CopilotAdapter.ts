@@ -1,3 +1,10 @@
+// TODO(copilot-effect-shim): The Copilot SDK is wired in here imperatively via
+// callback-based promise bridging (onEvent / onPermissionRequest / onUserInputRequest).
+// Per julius's review on PR #2185, this should eventually be wrapped as a thin
+// Effect-shaped shim — Streams for events, Effect-returning promises for the
+// permission/input prompts — mirroring the pattern used by `effect-codex-app-server`
+// and `CodexSessionRuntime`. Deferring until after the merge lands; the refactor
+// is large enough (~80KB adapter) to warrant its own PR.
 import type {
   CopilotClient,
   CopilotSession,
@@ -23,7 +30,14 @@ import {
   type UserInputQuestion,
 } from "@t3tools/contracts";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
-import { Deferred, Effect, Layer, Path, Predicate, PubSub, Random, Stream } from "effect";
+import { randomUUID } from "node:crypto";
+import * as Deferred from "effect/Deferred";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
+import * as Predicate from "effect/Predicate";
+import * as PubSub from "effect/PubSub";
+import * as Stream from "effect/Stream";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
@@ -185,7 +199,7 @@ function createBaseEvent(input: {
   readonly raw?: SessionEvent | undefined;
 }) {
   return {
-    eventId: EventId.make(Effect.runSync(Random.nextUUIDv4)),
+    eventId: EventId.make(randomUUID()),
     provider: PROVIDER,
     threadId: input.threadId,
     createdAt: input.createdAt ?? nowIso(),
@@ -595,7 +609,7 @@ function resolveTurnIdForSdkTurn(context: CopilotSessionContext, sdkTurnId: stri
     context.queuedTurnIds.shift() ??
     context.activeTurnId ??
     latestTurnId(context) ??
-    TurnId.make(`copilot-turn-${Effect.runSync(Random.nextUUIDv4)}`);
+    TurnId.make(`copilot-turn-${randomUUID()}`);
   context.sdkTurnIdsToTurnIds.set(sdkTurnId, nextTurnId);
   ensureTurnSnapshot(context, nextTurnId);
   context.activeSdkTurnId = sdkTurnId;
@@ -2132,7 +2146,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           );
         }
 
-        const turnId = TurnId.make(`copilot-turn-${yield* Random.nextUUIDv4}`);
+        const turnId = TurnId.make(`copilot-turn-${randomUUID()}`);
         const modelSelection =
           input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
         const reasoningEffort = getCopilotReasoningEffort(modelSelection);

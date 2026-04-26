@@ -11,7 +11,7 @@ import {
   createCopilotClient,
   formatCopilotProbeError,
   modelsFromCopilotSdk,
-  toCopilotProbeError,
+  CopilotProbePromiseError,
   versionFromCopilotStatus,
 } from "../copilotRuntime.ts";
 
@@ -135,7 +135,7 @@ export function checkCopilotProviderStatus(input: {
             },
           });
         },
-        catch: toCopilotProbeError,
+        catch: (cause) => new CopilotProbePromiseError(cause),
       }).pipe(Effect.catch((cause) => Effect.succeed(fallback(cause)))),
     (client) => Effect.promise(() => client.stop()).pipe(Effect.ignore({ log: true })),
   );

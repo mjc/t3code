@@ -59,7 +59,9 @@ beforeEach(() => {
 
 const CopilotProviderTestLayer = CopilotProviderLive.pipe(
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
-  Layer.provideMerge(ServerSettingsService.layerTest()),
+  Layer.provideMerge(
+    ServerSettingsService.layerTest({ providers: { copilot: { enabled: true } } }),
+  ),
   Layer.provideMerge(NodeServices.layer),
 );
 

@@ -51,10 +51,6 @@ export function trimOrUndefined(value: string | null | undefined): string | unde
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
 }
 
-export function toCopilotProbeError(cause: unknown): CopilotProbePromiseError {
-  return new CopilotProbePromiseError(cause);
-}
-
 function describeCopilotProbeCause(cause: unknown): string {
   const seen = new Set<unknown>();
   let current: unknown = cause;

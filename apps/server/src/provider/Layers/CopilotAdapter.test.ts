@@ -99,7 +99,9 @@ const CopilotAdapterTestLayer = makeCopilotAdapterLive().pipe(
       prefix: "t3code-copilot-adapter-test-",
     }),
   ),
-  Layer.provideMerge(ServerSettingsService.layerTest()),
+  Layer.provideMerge(
+    ServerSettingsService.layerTest({ providers: { copilot: { enabled: true } } }),
+  ),
   Layer.provideMerge(NodeServices.layer),
 );
 
