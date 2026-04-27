@@ -36,9 +36,7 @@ const makeProviderAdapterRegistry = Effect.fn("makeProviderAdapterRegistry")(fun
       ? options.adapters
       : createBuiltInAdapterList({
           codex: yield* CodexAdapter,
-          ...(copilotAdapterOption._tag === "Some"
-            ? { copilot: copilotAdapterOption.value }
-            : {}),
+          ...(copilotAdapterOption._tag === "Some" ? { copilot: copilotAdapterOption.value } : {}),
           claudeAgent: yield* ClaudeAdapter,
           opencode: yield* OpenCodeAdapter,
           ...(cursorAdapterOption._tag === "Some" ? { cursor: cursorAdapterOption.value } : {}),
