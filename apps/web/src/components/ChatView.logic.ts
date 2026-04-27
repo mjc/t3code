@@ -338,8 +338,14 @@ export function hasServerAcknowledgedLocalDispatch(input: {
     if (!latestTurnChanged) {
       return false;
     }
-    if (latestTurn?.startedAt === null || latestTurn === null) {
+    if (latestTurn === null) {
       return false;
+    }
+    if (latestTurn.startedAt === null) {
+      return (
+        input.localDispatch.latestTurnTurnId !== (latestTurn.turnId ?? null) ||
+        input.localDispatch.latestTurnRequestedAt !== (latestTurn.requestedAt ?? null)
+      );
     }
     if (
       session?.activeTurnId !== undefined &&
