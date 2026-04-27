@@ -17,6 +17,10 @@ import {
 
 const PROVIDER = "copilot" as const;
 const COPILOT_REFRESH_INTERVAL = "1 hour";
+const COPILOT_PRESENTATION = {
+  displayName: "GitHub Copilot",
+  showInteractionModeToggle: true,
+} as const;
 
 function makePendingCopilotProvider(settings: CopilotSettings): ServerProvider {
   const checkedAt = new Date().toISOString();
@@ -28,6 +32,7 @@ function makePendingCopilotProvider(settings: CopilotSettings): ServerProvider {
   if (!settings.enabled) {
     return buildServerProvider({
       provider: PROVIDER,
+      presentation: COPILOT_PRESENTATION,
       enabled: false,
       checkedAt,
       models,
@@ -43,6 +48,7 @@ function makePendingCopilotProvider(settings: CopilotSettings): ServerProvider {
 
   return buildServerProvider({
     provider: PROVIDER,
+    presentation: COPILOT_PRESENTATION,
     enabled: true,
     checkedAt,
     models,
@@ -72,6 +78,7 @@ export function checkCopilotProviderStatus(input: {
     });
     return buildServerProvider({
       provider: PROVIDER,
+      presentation: COPILOT_PRESENTATION,
       enabled: true,
       checkedAt,
       models: modelsFromCopilotSdk({
@@ -114,6 +121,7 @@ export function checkCopilotProviderStatus(input: {
 
           return buildServerProvider({
             provider: PROVIDER,
+            presentation: COPILOT_PRESENTATION,
             enabled: true,
             checkedAt,
             models: providerModels,
