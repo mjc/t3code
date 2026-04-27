@@ -353,6 +353,266 @@ it.layer(CopilotAdapterTestLayer)("CopilotAdapterLive", (it) => {
       }),
   );
 
+  it.effect("keeps Copilot turns queued until the SDK reports assistant.turn_start", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CopilotAdapter;
+      const threadId = asThreadId("copilot-turn-start-driven-running-state");
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "hello",
+        attachments: [],
+      });
+
+      let session = (yield* adapter.listSessions()).find((entry) => entry.threadId === threadId);
+      assert.ok(session);
+      assert.equal(session.status, "ready");
+      assert.equal(session.activeTurnId, undefined);
+
+      const config = runtimeMock.state.createSessionConfigs.at(-1);
+      assert.ok(config?.onEvent);
+      config.onEvent?.({
+        id: "evt-copilot-turn-start-running-state",
+        timestamp: new Date().toISOString(),
+        parentId: null,
+        type: "assistant.turn_start",
+        data: {
+          turnId: "sdk-turn-running-state",
+        },
+      } as SessionEvent);
+
+      yield* waitForSdkEventQueue();
+
+      session = (yield* adapter.listSessions()).find((entry) => entry.threadId === threadId);
+      assert.ok(session);
+      assert.equal(session.status, "running");
+      assert.equal(session.activeTurnId, turn.turnId);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("maps queued Copilot turns to SDK turn_start events in order", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CopilotAdapter;
+      const threadId = asThreadId("copilot-queued-turn-order");
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+
+      const firstTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "first",
+        attachments: [],
+      });
+      const secondTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "second",
+        attachments: [],
+      });
+
+      const config = runtimeMock.state.createSessionConfigs.at(-1);
+      assert.ok(config?.onEvent);
+      const emit = (event: SessionEvent) => config.onEvent?.(event);
+
+      emit({
+        id: "evt-copilot-turn-start-1",
+        timestamp: new Date().toISOString(),
+        parentId: null,
+        type: "assistant.turn_start",
+        data: {
+          turnId: "sdk-turn-1",
+        },
+      } as SessionEvent);
+      emit({
+        id: "evt-copilot-message-1",
+        timestamp: new Date().toISOString(),
+        parentId: null,
+        type: "assistant.message",
+        data: {
+          messageId: "message-1",
+          content: "first result",
+        },
+      } as SessionEvent);
+      emit({
+        id: "evt-copilot-turn-end-1",
+        timestamp: new Date().toISOString(),
+        parentId: null,
+        type: "assistant.turn_end",
+        data: {
+          turnId: "sdk-turn-1",
+        },
+      } as SessionEvent);
+      emit({
+        id: "evt-copilot-turn-start-2",
+        timestamp: new Date().toISOString(),
+        parentId: null,
+        type: "assistant.turn_start",
+        data: {
+          turnId: "sdk-turn-2",
+        },
+      } as SessionEvent);
+      emit({
+        id: "evt-copilot-message-2",
+        timestamp: new Date().toISOString(),
+        parentId: null,
+        type: "assistant.message",
+        data: {
+          messageId: "message-2",
+          content: "second result",
+        },
+      } as SessionEvent);
+      emit({
+        id: "evt-copilot-turn-end-2",
+        timestamp: new Date().toISOString(),
+        parentId: null,
+        type: "assistant.turn_end",
+        data: {
+          turnId: "sdk-turn-2",
+        },
+      } as SessionEvent);
+
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        yield* waitForSdkEventQueue();
+      }
+
+      const thread = yield* adapter.readThread(threadId);
+      const firstSnapshot = thread.turns.find((entry) => entry.id === firstTurn.turnId);
+      const secondSnapshot = thread.turns.find((entry) => entry.id === secondTurn.turnId);
+      assert.ok(firstSnapshot);
+      assert.ok(secondSnapshot);
+      assert.ok(
+        firstSnapshot.items.some(
+          (item) =>
+            typeof item === "object" &&
+            item !== null &&
+            "messageId" in item &&
+            item.messageId === "message-1",
+        ),
+      );
+      assert.ok(
+        secondSnapshot.items.some(
+          (item) =>
+            typeof item === "object" &&
+            item !== null &&
+            "messageId" in item &&
+            item.messageId === "message-2",
+        ),
+      );
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("does not clear the running turn until the SDK abort event arrives", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CopilotAdapter;
+      const threadId = asThreadId("copilot-interrupt-waits-for-sdk-abort");
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "interrupt me",
+        attachments: [],
+      });
+
+      const config = runtimeMock.state.createSessionConfigs.at(-1);
+      assert.ok(config?.onEvent);
+      config.onEvent?.({
+        id: "evt-copilot-turn-start-interrupt",
+        timestamp: new Date().toISOString(),
+        parentId: null,
+        type: "assistant.turn_start",
+        data: {
+          turnId: "sdk-turn-interrupt",
+        },
+      } as SessionEvent);
+
+      yield* waitForSdkEventQueue();
+      yield* adapter.interruptTurn(threadId, turn.turnId);
+
+      let session = (yield* adapter.listSessions()).find((entry) => entry.threadId === threadId);
+      assert.ok(session);
+      assert.equal(session.status, "running");
+      assert.equal(session.activeTurnId, turn.turnId);
+      assert.equal(runtimeMock.state.lastSession.abort.mock.calls.length, 1);
+
+      config.onEvent?.({
+        id: "evt-copilot-abort-interrupt",
+        timestamp: new Date().toISOString(),
+        parentId: null,
+        type: "abort",
+        data: {
+          reason: "Interrupted by user.",
+        },
+      } as SessionEvent);
+
+      yield* waitForSdkEventQueue();
+
+      session = (yield* adapter.listSessions()).find((entry) => entry.threadId === threadId);
+      assert.ok(session);
+      assert.equal(session.status, "ready");
+      assert.equal(session.activeTurnId, undefined);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("aborts an active Copilot turn before stopping the session", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CopilotAdapter;
+      const threadId = asThreadId("copilot-stop-session-aborts-active-turn");
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "stop me",
+        attachments: [],
+      });
+
+      const config = runtimeMock.state.createSessionConfigs.at(-1);
+      assert.ok(config?.onEvent);
+      config.onEvent?.({
+        id: "evt-copilot-turn-start-stop",
+        timestamp: new Date().toISOString(),
+        parentId: null,
+        type: "assistant.turn_start",
+        data: {
+          turnId: "sdk-turn-stop",
+        },
+      } as SessionEvent);
+
+      yield* waitForSdkEventQueue();
+      yield* adapter.stopSession(threadId);
+
+      assert.equal(runtimeMock.state.lastSession.abort.mock.calls.length, 1);
+      assert.equal(runtimeMock.state.lastSession.disconnect.mock.calls.length, 1);
+    }),
+  );
+
   it.effect("treats bare aborted send failures as cancelled without leaving a session error", () =>
     Effect.gen(function* () {
       runtimeMock.state.lastSession.send.mockRejectedValueOnce(new Error("aborted"));

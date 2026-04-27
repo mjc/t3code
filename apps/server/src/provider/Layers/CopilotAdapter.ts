@@ -92,6 +92,16 @@ interface CopilotTurnSnapshot {
   readonly items: Array<unknown>;
 }
 
+interface CopilotTurnStartPayload {
+  readonly model?: string;
+  readonly effort?: CopilotReasoningEffort;
+}
+
+interface CopilotCurrentTurn {
+  readonly turnId: TurnId;
+  readonly sdkTurnId: string;
+}
+
 interface PendingPermissionHandler {
   readonly signature: string;
   readonly deferred: Deferred.Deferred<PermissionRequestResult>;
@@ -139,6 +149,7 @@ interface CopilotSessionContext {
   readonly cwd: string;
   readonly turns: Array<CopilotTurnSnapshot>;
   readonly queuedTurnIds: Array<TurnId>;
+  readonly turnStartPayloadByTurnId: Map<TurnId, CopilotTurnStartPayload>;
   readonly sdkTurnIdsToTurnIds: Map<string, TurnId>;
   readonly completedTurnIds: Set<TurnId>;
   readonly turnUsageByTurnId: Map<TurnId, ThreadTokenUsageSnapshot>;
@@ -163,8 +174,7 @@ interface CopilotSessionContext {
   readonly collaborationModeRef: {
     current: CopilotCollaborationMode;
   };
-  activeTurnId: TurnId | undefined;
-  activeSdkTurnId: string | undefined;
+  currentTurn: CopilotCurrentTurn | undefined;
   eventChain: Promise<void>;
   stopped: boolean;
 }
@@ -670,23 +680,56 @@ function latestTurnId(context: CopilotSessionContext): TurnId | undefined {
   return context.turns.at(-1)?.id;
 }
 
+function currentTurnId(context: CopilotSessionContext): TurnId | undefined {
+  return context.currentTurn?.turnId;
+}
+
+function currentSdkTurnId(context: CopilotSessionContext): string | undefined {
+  return context.currentTurn?.sdkTurnId;
+}
+
+function setCurrentTurn(
+  context: CopilotSessionContext,
+  input: {
+    readonly turnId: TurnId;
+    readonly sdkTurnId: string;
+  },
+): void {
+  context.currentTurn = {
+    turnId: input.turnId,
+    sdkTurnId: input.sdkTurnId,
+  };
+}
+
+function clearCurrentTurn(context: CopilotSessionContext, turnId?: TurnId): void {
+  if (!context.currentTurn) {
+    return;
+  }
+  if (turnId !== undefined && context.currentTurn.turnId !== turnId) {
+    return;
+  }
+  context.currentTurn = undefined;
+}
+
 function resolveTurnIdForSdkTurn(context: CopilotSessionContext, sdkTurnId: string): TurnId {
   const existing = context.sdkTurnIdsToTurnIds.get(sdkTurnId);
   if (existing) {
+    setCurrentTurn(context, {
+      turnId: existing,
+      sdkTurnId,
+    });
     return existing;
   }
   const nextTurnId =
     context.queuedTurnIds.shift() ??
-    context.activeTurnId ??
+    currentTurnId(context) ??
     latestTurnId(context) ??
     TurnId.make(`copilot-turn-${randomUUID()}`);
   context.sdkTurnIdsToTurnIds.set(sdkTurnId, nextTurnId);
   ensureTurnSnapshot(context, nextTurnId);
-  context.activeSdkTurnId = sdkTurnId;
-  context.activeTurnId = nextTurnId;
-  updateProviderSession(context, {
-    status: "running",
-    activeTurnId: nextTurnId,
+  setCurrentTurn(context, {
+    turnId: nextTurnId,
+    sdkTurnId,
   });
   return nextTurnId;
 }
@@ -712,10 +755,10 @@ function resolveTurnIdForEvent(
   if (input?.sdkTurnId) {
     return resolveTurnIdForSdkTurn(context, input.sdkTurnId);
   }
-  if (context.activeSdkTurnId) {
-    return context.sdkTurnIdsToTurnIds.get(context.activeSdkTurnId) ?? context.activeTurnId;
+  if (currentSdkTurnId(context)) {
+    return context.sdkTurnIdsToTurnIds.get(currentSdkTurnId(context)!) ?? currentTurnId(context);
   }
-  return context.activeTurnId ?? latestTurnId(context);
+  return currentTurnId(context) ?? latestTurnId(context);
 }
 
 export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
@@ -927,20 +970,30 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
         if (context.completedTurnIds.has(turnId)) {
           context.pendingTaskCompletionTextByTurnId.delete(turnId);
           context.turnIdsWithAssistantText.delete(turnId);
+          context.turnStartPayloadByTurnId.delete(turnId);
           return;
         }
         context.completedTurnIds.add(turnId);
         context.pendingTaskCompletionTextByTurnId.delete(turnId);
         context.turnIdsWithAssistantText.delete(turnId);
-        if (context.activeTurnId === turnId) {
-          context.activeTurnId = undefined;
+        context.turnStartPayloadByTurnId.delete(turnId);
+        if (currentTurnId(context) === turnId) {
+          clearCurrentTurn(context, turnId);
         }
+        const nextActiveTurnId = currentTurnId(context);
         updateProviderSession(context, {
-          status: status === "failed" ? "error" : context.stopped ? "closed" : "ready",
+          status:
+            status === "failed"
+              ? "error"
+              : context.stopped
+                ? "closed"
+                : nextActiveTurnId
+                  ? "running"
+                  : "ready",
           ...(status === "failed"
             ? { lastError: input?.errorMessage ?? context.session.lastError ?? null }
             : { lastError: null }),
-          activeTurnId: undefined,
+          activeTurnId: nextActiveTurnId,
         });
         await emitAsync({
           ...createBaseEvent({
@@ -1257,7 +1310,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
         fallbackPlan?: string | undefined,
       ): Effect.Effect<void, ProviderAdapterRequestError> =>
         Effect.gen(function* () {
-          const turnId = context.activeTurnId ?? latestTurnId(context);
+          const turnId = currentTurnId(context) ?? latestTurnId(context);
           if (!turnId) {
             return;
           }
@@ -1402,8 +1455,8 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
               lastError: message,
               activeTurnId: undefined,
             });
-            if (context.activeTurnId) {
-              await emitTurnCompleted(context, context.activeTurnId, "failed", {
+            if (currentTurnId(context)) {
+              await emitTurnCompleted(context, currentTurnId(context)!, "failed", {
                 errorMessage: message,
                 raw: event,
               });
@@ -1435,17 +1488,17 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             return;
           }
           case "session.idle": {
-            if (context.activeTurnId) {
+            if (currentTurnId(context)) {
               if (!event.data.aborted) {
                 await emitPendingTaskCompletionAsAssistantMessage(
                   context,
-                  context.activeTurnId,
+                  currentTurnId(context)!,
                   event,
                 );
               }
               await emitTurnCompleted(
                 context,
-                context.activeTurnId,
+                currentTurnId(context)!,
                 event.data.aborted ? "cancelled" : "completed",
                 {
                   raw: event,
@@ -1544,7 +1597,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             await emitAsync({
               ...createBaseEvent({
                 threadId: context.threadId,
-                turnId: context.activeTurnId,
+                turnId: currentTurnId(context),
                 raw: event,
               }),
               type: "thread.token-usage.updated",
@@ -1556,6 +1609,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           }
           case "assistant.turn_start": {
             const turnId = resolveTurnIdForSdkTurn(context, event.data.turnId);
+            const startPayload = context.turnStartPayloadByTurnId.get(turnId);
             updateProviderSession(context, {
               status: "running",
               activeTurnId: turnId,
@@ -1572,11 +1626,24 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
                 reason: "Copilot turn started",
               },
             });
+            await emitAsync({
+              ...createBaseEvent({
+                threadId: context.threadId,
+                turnId,
+                raw: event,
+              }),
+              type: "turn.started",
+              payload: {
+                ...(startPayload?.model ? { model: startPayload.model } : {}),
+                ...(startPayload?.effort ? { effort: startPayload.effort } : {}),
+              },
+            });
+            context.turnStartPayloadByTurnId.delete(turnId);
             return;
           }
           case "assistant.reasoning_delta": {
             const turnId = resolveTurnIdForEvent(context, {
-              sdkTurnId: context.activeSdkTurnId,
+              sdkTurnId: currentSdkTurnId(context),
               providerItemId: event.data.reasoningId,
             });
             if (!turnId) {
@@ -1597,7 +1664,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           }
           case "assistant.reasoning": {
             const turnId = resolveTurnIdForEvent(context, {
-              sdkTurnId: context.activeSdkTurnId,
+              sdkTurnId: currentSdkTurnId(context),
               providerItemId: event.data.reasoningId,
             });
             if (!turnId) {
@@ -1636,7 +1703,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           }
           case "assistant.message_delta": {
             const turnId = resolveTurnIdForEvent(context, {
-              sdkTurnId: context.activeSdkTurnId,
+              sdkTurnId: currentSdkTurnId(context),
               providerItemId: event.data.messageId,
               parentProviderItemId: event.data.parentToolCallId,
             });
@@ -1658,7 +1725,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           }
           case "assistant.message": {
             const turnId = resolveTurnIdForEvent(context, {
-              sdkTurnId: context.activeSdkTurnId,
+              sdkTurnId: currentSdkTurnId(context),
               providerItemId: event.data.messageId,
               parentProviderItemId: event.data.parentToolCallId,
             });
@@ -1723,7 +1790,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           }
           case "assistant.turn_end": {
             const turnId =
-              context.sdkTurnIdsToTurnIds.get(event.data.turnId) ?? context.activeTurnId;
+              context.sdkTurnIdsToTurnIds.get(event.data.turnId) ?? currentTurnId(context);
             if (!turnId) {
               return;
             }
@@ -1732,15 +1799,15 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
               raw: event,
               stopReason: null,
             });
-            if (context.activeSdkTurnId === event.data.turnId) {
-              context.activeSdkTurnId = undefined;
+            if (currentSdkTurnId(context) === event.data.turnId) {
+              clearCurrentTurn(context, turnId);
             }
             return;
           }
           case "assistant.usage": {
             const turnId = resolveTurnIdForEvent(context, {
               parentProviderItemId: event.data.parentToolCallId,
-              sdkTurnId: context.activeSdkTurnId,
+              sdkTurnId: currentSdkTurnId(context),
             });
             if (!turnId) {
               return;
@@ -1761,7 +1828,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             return;
           }
           case "abort": {
-            const turnId = context.activeTurnId;
+            const turnId = currentTurnId(context);
             if (!turnId) {
               return;
             }
@@ -1786,7 +1853,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             const turnId = resolveTurnIdForEvent(context, {
               providerItemId: event.data.toolCallId,
               parentProviderItemId: event.data.parentToolCallId,
-              sdkTurnId: context.activeSdkTurnId,
+              sdkTurnId: currentSdkTurnId(context),
             });
             if (!turnId) {
               return;
@@ -1819,7 +1886,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           case "tool.execution_partial_result": {
             const turnId = resolveTurnIdForEvent(context, {
               providerItemId: event.data.toolCallId,
-              sdkTurnId: context.activeSdkTurnId,
+              sdkTurnId: currentSdkTurnId(context),
             });
             if (!turnId) {
               return;
@@ -1844,7 +1911,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           case "tool.execution_progress": {
             const turnId = resolveTurnIdForEvent(context, {
               providerItemId: event.data.toolCallId,
-              sdkTurnId: context.activeSdkTurnId,
+              sdkTurnId: currentSdkTurnId(context),
             });
             const toolMeta = context.toolMetaById.get(event.data.toolCallId);
             await emitAsync({
@@ -1867,7 +1934,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             const turnId = resolveTurnIdForEvent(context, {
               providerItemId: event.data.toolCallId,
               parentProviderItemId: event.data.parentToolCallId,
-              sdkTurnId: context.activeSdkTurnId,
+              sdkTurnId: currentSdkTurnId(context),
             });
             if (!turnId) {
               return;
@@ -2130,6 +2197,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             },
             turns: [],
             queuedTurnIds: [],
+            turnStartPayloadByTurnId: new Map(),
             sdkTurnIdsToTurnIds: new Map(),
             completedTurnIds: new Set(),
             turnUsageByTurnId: new Map(),
@@ -2146,8 +2214,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             turnIdsWithAssistantText: new Set(),
             startedItemIds: new Set(),
             collaborationModeRef,
-            activeTurnId: undefined,
-            activeSdkTurnId: undefined,
+            currentTurn: undefined,
             eventChain: Promise.resolve(),
             stopped: false,
           };
@@ -2245,26 +2312,14 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
         );
         yield* syncSessionMode(context, mode);
 
+        const selectedModelForTurn = modelSelection?.model ?? context.session.model;
+        const turnStartPayload = {
+          ...(selectedModelForTurn !== undefined ? { model: selectedModelForTurn } : {}),
+          ...(reasoningEffort ? { effort: reasoningEffort } : {}),
+        } satisfies CopilotTurnStartPayload;
         ensureTurnSnapshot(context, turnId);
         context.queuedTurnIds.push(turnId);
-        context.activeTurnId = turnId;
-        updateProviderSession(context, {
-          status: "running",
-          activeTurnId: turnId,
-          ...(modelSelection?.model ? { model: modelSelection.model } : {}),
-        });
-
-        yield* emit({
-          ...createBaseEvent({
-            threadId: input.threadId,
-            turnId,
-          }),
-          type: "turn.started",
-          payload: {
-            model: modelSelection?.model ?? context.session.model,
-            ...(reasoningEffort ? { effort: reasoningEffort } : {}),
-          },
-        });
+        context.turnStartPayloadByTurnId.set(turnId, turnStartPayload);
 
         const messageOptions: MessageOptions = {
           prompt: text ?? "",
@@ -2279,11 +2334,12 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
               if (queueIndex >= 0) {
                 context.queuedTurnIds.splice(queueIndex, 1);
               }
-              context.activeTurnId = undefined;
+              context.turnStartPayloadByTurnId.delete(turnId);
+              const nextActiveTurnId = currentTurnId(context);
               if (isCopilotAbortLikeDetail(error.detail)) {
                 updateProviderSession(context, {
-                  status: "ready",
-                  activeTurnId: undefined,
+                  status: nextActiveTurnId ? "running" : "ready",
+                  activeTurnId: nextActiveTurnId,
                   lastError: null,
                 });
                 return yield* emit({
@@ -2299,8 +2355,8 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
                 });
               }
               updateProviderSession(context, {
-                status: "ready",
-                activeTurnId: undefined,
+                status: nextActiveTurnId ? "running" : "ready",
+                activeTurnId: nextActiveTurnId,
               });
               yield* emit({
                 ...createBaseEvent({
@@ -2327,22 +2383,12 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
       const interruptTurn: CopilotAdapterShape["interruptTurn"] = Effect.fn("interruptTurn")(
         function* (threadId, turnId) {
           const context = yield* requireSessionContext(sessions, threadId);
+          const targetTurnId = turnId ?? currentTurnId(context);
+          if (!targetTurnId || context.completedTurnIds.has(targetTurnId)) {
+            return;
+          }
 
           yield* copilotSdk.abort(context);
-
-          const targetTurnId = turnId ?? context.activeTurnId;
-          if (targetTurnId) {
-            yield* emit({
-              ...createBaseEvent({
-                threadId,
-                turnId: targetTurnId,
-              }),
-              type: "turn.aborted",
-              payload: {
-                reason: "Interrupted by user.",
-              },
-            });
-          }
         },
       );
 
@@ -2397,6 +2443,15 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           }
 
           context.stopped = true;
+          const activeTurnId = currentTurnId(context);
+          if (activeTurnId && !context.completedTurnIds.has(activeTurnId)) {
+            yield* copilotSdk.abort(context).pipe(Effect.ignore);
+            yield* Effect.promise(() =>
+              emitTurnCompleted(context, activeTurnId, "cancelled", {
+                stopReason: "aborted",
+              }),
+            );
+          }
           yield* settlePendingPermissionHandlers(context);
           yield* settlePendingUserInputs(context);
           yield* copilotSdk.disconnect(context).pipe(Effect.ignore);
