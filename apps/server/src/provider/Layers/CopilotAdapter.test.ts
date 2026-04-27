@@ -198,6 +198,54 @@ it.layer(CopilotAdapterTestLayer)("CopilotAdapterLive", (it) => {
       }),
   );
 
+  it.effect("switches the injected Copilot developer instructions with plan mode", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CopilotAdapter;
+      const threadId = asThreadId("copilot-plan-mode-instructions");
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+
+      const config = runtimeMock.state.createSessionConfigs.at(-1);
+      const systemMessage = config?.systemMessage;
+      assert.ok(systemMessage);
+      assert.equal(systemMessage.mode, "customize");
+      const lastInstructions = systemMessage.sections?.last_instructions;
+      assert.ok(lastInstructions);
+      if (typeof lastInstructions.action !== "function") {
+        assert.fail("expected a transform callback for the Copilot last_instructions section");
+      }
+
+      const renderInstructions = lastInstructions.action;
+      const defaultInstructions = yield* Effect.promise(() =>
+        Promise.resolve(renderInstructions("SDK base instructions")),
+      );
+      assert.match(defaultInstructions, /Collaboration Mode: Default/);
+
+      yield* adapter.sendTurn({
+        threadId,
+        input: "plan this change",
+        attachments: [],
+        interactionMode: "plan",
+      });
+
+      const planInstructions = yield* Effect.promise(() =>
+        Promise.resolve(renderInstructions("SDK base instructions")),
+      );
+      assert.match(planInstructions, /Plan Mode \(Conversational\)/);
+      assert.match(planInstructions, /<proposed_plan>/);
+      assert.deepStrictEqual(runtimeMock.state.lastSession.rpc.mode.set.mock.calls.at(-1), [
+        { mode: "plan" },
+      ]);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect(
     "renders Copilot Task_complete tool output as assistant text when no assistant message arrives",
     () =>

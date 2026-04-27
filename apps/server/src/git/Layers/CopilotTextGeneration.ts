@@ -13,7 +13,11 @@ import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
-import { createCopilotClient, trimOrUndefined } from "../../provider/copilotRuntime.ts";
+import {
+  createCopilotClient,
+  toCopilotReasoningEffort,
+  trimOrUndefined,
+} from "../../provider/copilotRuntime.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import {
   buildBranchNamePrompt,
@@ -261,9 +265,8 @@ const makeCopilotTextGeneration = Effect.gen(function* () {
         })
         .filter((attachment): attachment is NonNullable<typeof attachment> => attachment !== null);
 
-      const reasoningEffort = getModelSelectionStringOptionValue(
-        input.modelSelection,
-        "reasoningEffort",
+      const reasoningEffort = toCopilotReasoningEffort(
+        getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort"),
       );
       // Keep request state isolated per generation call while reusing the
       // started SDK client so git helpers do not respawn the Copilot CLI.

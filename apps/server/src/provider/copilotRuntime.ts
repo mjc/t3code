@@ -4,6 +4,7 @@ import {
   type GetAuthStatusResponse,
   type GetStatusResponse,
   type ModelInfo,
+  type SessionConfig,
 } from "@github/copilot-sdk";
 import type {
   CopilotSettings,
@@ -12,16 +13,15 @@ import type {
   ServerProviderModel,
   ServerProviderState,
 } from "@t3tools/contracts";
+import { createModelCapabilities } from "@t3tools/shared/model";
 
-import { providerModelsFromSettings } from "./providerSnapshot.ts";
+import { buildSelectOptionDescriptor, providerModelsFromSettings } from "./providerSnapshot.ts";
 
-export const EMPTY_COPILOT_MODEL_CAPABILITIES: ModelCapabilities = {
-  reasoningEffortLevels: [],
-  supportsFastMode: false,
-  supportsThinkingToggle: false,
-  contextWindowOptions: [],
-  promptInjectedEffortLevels: [],
-};
+type CopilotReasoningEffort = NonNullable<SessionConfig["reasoningEffort"]>;
+
+export const EMPTY_COPILOT_MODEL_CAPABILITIES: ModelCapabilities = createModelCapabilities({
+  optionDescriptors: [],
+});
 
 const COPILOT_REASONING_LABELS = {
   low: "Low",
@@ -49,6 +49,13 @@ export class CopilotProbePromiseError extends Error {
 export function trimOrUndefined(value: string | null | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
+}
+
+export function toCopilotReasoningEffort(
+  value: string | null | undefined,
+): CopilotReasoningEffort | undefined {
+  const trimmed = trimOrUndefined(value);
+  return trimmed ? (trimmed as CopilotReasoningEffort) : undefined;
 }
 
 function describeCopilotProbeCause(cause: unknown): string {
@@ -141,13 +148,18 @@ export function capabilitiesFromCopilotModel(
       ...(model.defaultReasoningEffort === effort ? { isDefault: true } : {}),
     })) ?? [];
 
-  return {
-    reasoningEffortLevels,
-    supportsFastMode: false,
-    supportsThinkingToggle: false,
-    contextWindowOptions: [],
-    promptInjectedEffortLevels: [],
-  };
+  return createModelCapabilities({
+    optionDescriptors:
+      reasoningEffortLevels.length > 0
+        ? [
+            buildSelectOptionDescriptor({
+              id: "reasoningEffort",
+              label: "Reasoning",
+              options: reasoningEffortLevels,
+            }),
+          ]
+        : [],
+  });
 }
 
 export function modelsFromCopilotSdk(input: {

@@ -43,6 +43,10 @@ import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import {
+  COPILOT_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS,
+  COPILOT_PLAN_MODE_DEVELOPER_INSTRUCTIONS,
+} from "../CopilotDeveloperInstructions.ts";
+import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
   ProviderAdapterSessionClosedError,
@@ -50,13 +54,18 @@ import {
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import { CopilotAdapter, type CopilotAdapterShape } from "../Services/CopilotAdapter.ts";
-import { createCopilotClient, trimOrUndefined } from "../copilotRuntime.ts";
+import {
+  createCopilotClient,
+  toCopilotReasoningEffort,
+  trimOrUndefined,
+} from "../copilotRuntime.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
 const PROVIDER = "copilot" as const;
 const COPILOT_RESUME_SCHEMA_VERSION = 1 as const;
 
 type CopilotMode = "interactive" | "plan" | "autopilot";
+type CopilotCollaborationMode = "default" | "plan";
 type CopilotReasoningEffort = NonNullable<SessionConfig["reasoningEffort"]>;
 type CopilotUserInputRequest = Parameters<NonNullable<SessionConfig["onUserInputRequest"]>>[0];
 type CopilotUserInputResponse = Awaited<
@@ -74,8 +83,9 @@ interface CopilotAdapterLiveOptions {
 const getCopilotReasoningEffort = (
   modelSelection: ModelSelection | undefined,
 ): CopilotReasoningEffort | undefined => {
-  const reasoningEffort = getModelSelectionStringOptionValue(modelSelection, "reasoningEffort");
-  return reasoningEffort ? (reasoningEffort as CopilotReasoningEffort) : undefined;
+  return toCopilotReasoningEffort(
+    getModelSelectionStringOptionValue(modelSelection, "reasoningEffort"),
+  );
 };
 interface CopilotTurnSnapshot {
   readonly id: TurnId;
@@ -150,6 +160,9 @@ interface CopilotSessionContext {
   readonly pendingTaskCompletionTextByTurnId: Map<TurnId, string>;
   readonly turnIdsWithAssistantText: Set<TurnId>;
   readonly startedItemIds: Set<string>;
+  readonly collaborationModeRef: {
+    current: CopilotCollaborationMode;
+  };
   activeTurnId: TurnId | undefined;
   activeSdkTurnId: string | undefined;
   eventChain: Promise<void>;
@@ -305,6 +318,35 @@ function requestedCopilotMode(input: {
     return "plan";
   }
   return input.runtimeMode === "approval-required" ? "interactive" : "autopilot";
+}
+
+function requestedCopilotCollaborationMode(
+  interactionMode: ProviderSendTurnInput["interactionMode"] | undefined,
+): CopilotCollaborationMode {
+  return interactionMode === "plan" ? "plan" : "default";
+}
+
+function copilotDeveloperInstructions(mode: CopilotCollaborationMode): string {
+  return mode === "plan"
+    ? COPILOT_PLAN_MODE_DEVELOPER_INSTRUCTIONS
+    : COPILOT_DEFAULT_MODE_DEVELOPER_INSTRUCTIONS;
+}
+
+function createCopilotSystemMessageConfig(collaborationModeRef: {
+  current: CopilotCollaborationMode;
+}): NonNullable<SessionConfig["systemMessage"]> {
+  return {
+    mode: "customize",
+    sections: {
+      last_instructions: {
+        action: (currentContent) => {
+          const instructions = copilotDeveloperInstructions(collaborationModeRef.current);
+          const trimmedCurrent = currentContent.trim();
+          return trimmedCurrent.length > 0 ? `${trimmedCurrent}\n\n${instructions}` : instructions;
+        },
+      },
+    },
+  };
 }
 
 function mapPermissionRequestType(
@@ -1960,6 +2002,9 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           const modelSelection =
             input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
           const reasoningEffort = getCopilotReasoningEffort(modelSelection);
+          const collaborationModeRef = {
+            current: "default" as CopilotCollaborationMode,
+          };
           let context: CopilotSessionContext | undefined;
           const earlyEvents: Array<SessionEvent> = [];
           const onEvent: SessionConfig["onEvent"] = (event) => {
@@ -2001,6 +2046,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             workingDirectory: cwd,
             streaming: true,
             enableConfigDiscovery: true,
+            systemMessage: createCopilotSystemMessageConfig(collaborationModeRef),
             onEvent,
           } satisfies Pick<
             SessionConfig,
@@ -2010,6 +2056,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             | "workingDirectory"
             | "streaming"
             | "enableConfigDiscovery"
+            | "systemMessage"
             | "onEvent"
           >;
 
@@ -2068,6 +2115,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             pendingTaskCompletionTextByTurnId: new Map(),
             turnIdsWithAssistantText: new Set(),
             startedItemIds: new Set(),
+            collaborationModeRef,
             activeTurnId: undefined,
             activeSdkTurnId: undefined,
             eventChain: Promise.resolve(),
@@ -2151,11 +2199,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           input.modelSelection?.provider === PROVIDER ? input.modelSelection : undefined;
         const reasoningEffort = getCopilotReasoningEffort(modelSelection);
         if (modelSelection?.model) {
-          yield* copilotSdk.setModel(
-            context,
-            modelSelection.model,
-            reasoningEffort,
-          );
+          yield* copilotSdk.setModel(context, modelSelection.model, reasoningEffort);
           updateProviderSession(context, {
             model: modelSelection.model,
             ...(reasoningEffort ? { status: "ready" } : {}),
@@ -2166,6 +2210,9 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           runtimeMode: context.session.runtimeMode,
           interactionMode: input.interactionMode,
         });
+        context.collaborationModeRef.current = requestedCopilotCollaborationMode(
+          input.interactionMode,
+        );
         yield* syncSessionMode(context, mode);
 
         ensureTurnSnapshot(context, turnId);
