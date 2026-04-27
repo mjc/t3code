@@ -141,6 +141,12 @@ export function getCustomModelOptionsByProvider(
       "codex",
       selectedProvider === "codex" ? selectedModel : undefined,
     ),
+    copilot: getAppModelOptions(
+      settings,
+      providers,
+      "copilot",
+      selectedProvider === "copilot" ? selectedModel : undefined,
+    ),
     claudeAgent: getAppModelOptions(
       settings,
       providers,

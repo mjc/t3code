@@ -369,25 +369,29 @@ describe("ProviderModelPicker", () => {
           slug: "auto",
           name: "Auto",
           isCustom: false,
-          capabilities: {
-            reasoningEffortLevels: [effort("low"), effort("medium", true), effort("high")],
-            supportsFastMode: false,
-            supportsThinkingToggle: false,
-            contextWindowOptions: [],
-            promptInjectedEffortLevels: [],
-          },
+          capabilities: createModelCapabilities({
+            optionDescriptors: [
+              selectDescriptor("reasoningEffort", "Reasoning", [
+                { id: "low", label: "low" },
+                { id: "medium", label: "medium", isDefault: true },
+                { id: "high", label: "high" },
+              ]),
+            ],
+          }),
         },
         {
           slug: "gpt-4.1",
           name: "GPT-4.1",
           isCustom: false,
-          capabilities: {
-            reasoningEffortLevels: [effort("low"), effort("medium", true), effort("high")],
-            supportsFastMode: false,
-            supportsThinkingToggle: false,
-            contextWindowOptions: [],
-            promptInjectedEffortLevels: [],
-          },
+          capabilities: createModelCapabilities({
+            optionDescriptors: [
+              selectDescriptor("reasoningEffort", "Reasoning", [
+                { id: "low", label: "low" },
+                { id: "medium", label: "medium", isDefault: true },
+                { id: "high", label: "high" },
+              ]),
+            ],
+          }),
         },
       ]),
       TEST_PROVIDERS[1]!,

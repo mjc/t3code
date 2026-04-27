@@ -78,6 +78,9 @@ const makeBinaryPathSetting = (fallback: string) =>
     ),
     Schema.withDecodingDefault(Effect.succeed(fallback)),
   );
+const OptionalBinaryPathSetting = TrimmedString.pipe(
+  Schema.withDecodingDefault(Effect.succeed("")),
+);
 
 export const CodexSettings = Schema.Struct({
   enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
