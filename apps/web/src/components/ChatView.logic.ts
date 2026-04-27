@@ -226,6 +226,20 @@ export function threadHasStarted(thread: Thread | null | undefined): boolean {
   );
 }
 
+export function shouldCanonicalizePromotedDraft(input: {
+  serverThreadStarted: boolean;
+  hasPendingApprovals: boolean;
+  hasPendingUserInput: boolean;
+  hasActionableProposedPlan: boolean;
+}): boolean {
+  return (
+    input.serverThreadStarted ||
+    input.hasPendingApprovals ||
+    input.hasPendingUserInput ||
+    input.hasActionableProposedPlan
+  );
+}
+
 export function deriveLockedProvider(input: {
   thread: Thread | null | undefined;
   selectedProvider: ProviderKind | null;

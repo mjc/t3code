@@ -19,12 +19,16 @@
             pkgs.git
             pkgs.bash
             pkgs.coreutils
+            pkgs.playwright-test
+            pkgs.playwright-driver.browsers
           ];
 
           # node:sqlite is used by apps/server/src/persistence/NodeSqliteClient.ts.
           # On Node.js 22 it remains experimental and requires the flag.
           # Node.js 24 enables it by default; the flag is harmless there.
           NODE_OPTIONS = "--experimental-sqlite";
+          PLAYWRIGHT_BROWSERS_PATH = "${pkgs.playwright-driver.browsers}";
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1";
         };
       });
 }

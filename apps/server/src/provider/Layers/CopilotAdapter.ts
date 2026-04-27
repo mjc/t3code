@@ -34,6 +34,7 @@ import { randomUUID } from "node:crypto";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Predicate from "effect/Predicate";
 import * as PubSub from "effect/PubSub";
@@ -54,6 +55,7 @@ import {
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import { CopilotAdapter, type CopilotAdapterShape } from "../Services/CopilotAdapter.ts";
+import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import {
   createCopilotClient,
   toCopilotReasoningEffort,
@@ -63,6 +65,7 @@ import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogg
 
 const PROVIDER = "copilot" as const;
 const COPILOT_RESUME_SCHEMA_VERSION = 1 as const;
+const COPILOT_RUNTIME_STATE_SCHEMA_VERSION = 1 as const;
 
 type CopilotMode = "interactive" | "plan" | "autopilot";
 type CopilotCollaborationMode = "default" | "plan";
@@ -99,7 +102,16 @@ interface CopilotTurnStartPayload {
 
 interface CopilotCurrentTurn {
   readonly turnId: TurnId;
-  readonly sdkTurnId: string;
+  readonly sdkTurnId?: string;
+}
+
+interface PersistedCopilotState {
+  readonly schemaVersion: 1;
+  readonly turns: Array<CopilotTurnSnapshot>;
+  readonly queuedTurnIds: Array<TurnId>;
+  readonly currentTurnId: TurnId | undefined;
+  readonly turnStartPayloadByTurnId: Array<readonly [TurnId, CopilotTurnStartPayload]>;
+  readonly pendingTaskCompletionTextByTurnId: Array<readonly [TurnId, string]>;
 }
 
 interface PendingPermissionHandler {
@@ -332,6 +344,166 @@ function requireSessionContext(
     }
     return context;
   });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function readPersistedTurnId(value: unknown): TurnId | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? TurnId.make(trimmed) : undefined;
+}
+
+function readPersistedTurns(value: unknown): Array<CopilotTurnSnapshot> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((entry) => {
+    if (!isRecord(entry)) {
+      return [];
+    }
+    const turnId = readPersistedTurnId(entry.id);
+    if (!turnId || !Array.isArray(entry.items)) {
+      return [];
+    }
+    return [
+      {
+        id: turnId,
+        items: [...entry.items],
+      } satisfies CopilotTurnSnapshot,
+    ];
+  });
+}
+
+function readPersistedTurnStartPayloadByTurnId(
+  value: unknown,
+): Array<readonly [TurnId, CopilotTurnStartPayload]> {
+  if (!isRecord(value)) {
+    return [];
+  }
+  return Object.entries(value).flatMap(([turnId, payload]) => {
+    const parsedTurnId = readPersistedTurnId(turnId);
+    if (!parsedTurnId || !isRecord(payload)) {
+      return [];
+    }
+    const model = typeof payload.model === "string" ? trimOrUndefined(payload.model) : undefined;
+    const effort =
+      typeof payload.effort === "string" ? toCopilotReasoningEffort(payload.effort) : undefined;
+    return [
+      [parsedTurnId, { ...(model ? { model } : {}), ...(effort ? { effort } : {}) }],
+    ] as const;
+  });
+}
+
+function readPersistedTurnTextMap(value: unknown): Array<readonly [TurnId, string]> {
+  if (!isRecord(value)) {
+    return [];
+  }
+  return Object.entries(value).flatMap(([turnId, text]) => {
+    const parsedTurnId = readPersistedTurnId(turnId);
+    return parsedTurnId && typeof text === "string" ? ([[parsedTurnId, text]] as const) : [];
+  });
+}
+
+function readPersistedCopilotState(runtimePayload: unknown): PersistedCopilotState | undefined {
+  if (!isRecord(runtimePayload)) {
+    return undefined;
+  }
+  const rawState = runtimePayload.copilotState;
+  if (!isRecord(rawState) || rawState.schemaVersion !== COPILOT_RUNTIME_STATE_SCHEMA_VERSION) {
+    return undefined;
+  }
+  const queuedTurnIds = Array.isArray(rawState.queuedTurnIds)
+    ? rawState.queuedTurnIds.flatMap((entry) => {
+        const turnId = readPersistedTurnId(entry);
+        return turnId ? [turnId] : [];
+      })
+    : [];
+  const currentTurnId = readPersistedTurnId(rawState.currentTurnId);
+  return {
+    schemaVersion: COPILOT_RUNTIME_STATE_SCHEMA_VERSION,
+    turns: readPersistedTurns(rawState.turns),
+    queuedTurnIds,
+    currentTurnId,
+    turnStartPayloadByTurnId: readPersistedTurnStartPayloadByTurnId(
+      rawState.turnStartPayloadByTurnId,
+    ),
+    pendingTaskCompletionTextByTurnId: readPersistedTurnTextMap(
+      rawState.pendingTaskCompletionTextByTurnId,
+    ),
+  };
+}
+
+function readPersistedActiveTurnId(runtimePayload: unknown): TurnId | undefined {
+  if (!isRecord(runtimePayload)) {
+    return undefined;
+  }
+  return readPersistedTurnId(runtimePayload.activeTurnId);
+}
+
+function toPersistedCopilotRuntimePayload(context: CopilotSessionContext): Record<string, unknown> {
+  return {
+    activeTurnId: currentTurnId(context) ?? null,
+    copilotState: {
+      schemaVersion: COPILOT_RUNTIME_STATE_SCHEMA_VERSION,
+      turns: context.turns.map((turn) => ({
+        id: turn.id,
+        items: [...turn.items],
+      })),
+      queuedTurnIds: [...context.queuedTurnIds],
+      currentTurnId: currentTurnId(context) ?? null,
+      turnStartPayloadByTurnId: Object.fromEntries(context.turnStartPayloadByTurnId),
+      pendingTaskCompletionTextByTurnId: Object.fromEntries(
+        context.pendingTaskCompletionTextByTurnId,
+      ),
+    },
+  };
+}
+
+function restorePersistedCopilotMappings(context: CopilotSessionContext): void {
+  for (const turn of context.turns) {
+    for (const item of turn.items) {
+      if (!isRecord(item) || typeof item.type !== "string") {
+        continue;
+      }
+      switch (item.type) {
+        case "assistant_message": {
+          if (typeof item.messageId === "string" && item.messageId.trim().length > 0) {
+            context.turnIdByProviderItemId.set(item.messageId, turn.id);
+            context.turnIdsWithAssistantText.add(turn.id);
+          }
+          break;
+        }
+        case "reasoning": {
+          if (typeof item.reasoningId === "string" && item.reasoningId.trim().length > 0) {
+            context.turnIdByProviderItemId.set(item.reasoningId, turn.id);
+          }
+          break;
+        }
+        case "tool_execution": {
+          if (typeof item.toolCallId === "string" && item.toolCallId.trim().length > 0) {
+            context.turnIdByProviderItemId.set(item.toolCallId, turn.id);
+            if (typeof item.toolName === "string" && item.toolName.trim().length > 0) {
+              context.toolMetaById.set(item.toolCallId, {
+                toolName: item.toolName,
+                itemType: toolItemType(item.toolName, undefined),
+              });
+            }
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+  }
+  for (const turnId of context.queuedTurnIds) {
+    ensureTurnSnapshot(context, turnId);
+  }
 }
 
 function requestedCopilotMode(input: {
@@ -767,6 +939,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
     Effect.gen(function* () {
       const serverConfig = yield* ServerConfig;
       const serverSettingsService = yield* ServerSettingsService;
+      const directory = yield* ProviderSessionDirectory;
       const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
       const nativeEventLogger =
         options?.nativeEventLogger ??
@@ -791,6 +964,31 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
               nativeEventLogger.write({ source: "copilot.sdk.event", payload: event }, threadId),
             )
           : Promise.resolve();
+      const readPersistedBinding = (threadId: ThreadId) =>
+        directory
+          .getBinding(threadId)
+          .pipe(
+            Effect.mapError((cause) =>
+              processError(threadId, "Failed to read persisted Copilot session state.", cause),
+            ),
+          );
+      const persistSessionState = (
+        context: CopilotSessionContext,
+      ): Effect.Effect<void, ProviderAdapterProcessError> =>
+        directory
+          .upsert({
+            threadId: context.threadId,
+            provider: PROVIDER,
+            runtimePayload: toPersistedCopilotRuntimePayload(context),
+          })
+          .pipe(
+            Effect.mapError((cause) =>
+              processError(context.threadId, "Failed to persist Copilot session state.", cause),
+            ),
+            Effect.asVoid,
+          );
+      const persistSessionStateAsync = (context: CopilotSessionContext) =>
+        runWithContext(persistSessionState(context));
 
       const copilotSdk = {
         startClient: (threadId: ThreadId, client: CopilotClient) =>
@@ -995,6 +1193,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             : { lastError: null }),
           activeTurnId: nextActiveTurnId,
         });
+        await persistSessionStateAsync(context);
         await emitAsync({
           ...createBaseEvent({
             threadId: context.threadId,
@@ -1395,11 +1594,13 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           }
           case "session.resume": {
             updateProviderSession(context, {
-              status: "ready",
+              status: currentTurnId(context) ? "running" : "ready",
               model: trimOrUndefined(event.data.selectedModel) ?? context.session.model,
               ...(event.data.context?.cwd ? { cwd: event.data.context.cwd } : {}),
               resumeCursor: toCopilotResumeCursor(context.sdkSession.sessionId),
+              activeTurnId: currentTurnId(context),
             });
+            await persistSessionStateAsync(context);
             await emitAsync({
               ...createBaseEvent({
                 threadId: context.threadId,
@@ -1614,6 +1815,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
               status: "running",
               activeTurnId: turnId,
             });
+            await persistSessionStateAsync(context);
             await emitAsync({
               ...createBaseEvent({
                 threadId: context.threadId,
@@ -1699,6 +1901,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
               reasoningId: event.data.reasoningId,
               content: event.data.content,
             });
+            await persistSessionStateAsync(context);
             return;
           }
           case "assistant.message_delta": {
@@ -1786,6 +1989,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
               messageId: event.data.messageId,
               content: event.data.content,
             });
+            await persistSessionStateAsync(context);
             return;
           }
           case "assistant.turn_end": {
@@ -1981,6 +2185,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             if (event.data.success && detail && isTaskCompleteTool(toolMeta?.toolName)) {
               context.pendingTaskCompletionTextByTurnId.set(turnId, detail);
             }
+            await persistSessionStateAsync(context);
             return;
           }
           case "permission.requested": {
@@ -2135,6 +2340,19 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             cwd,
             logLevel: "error",
           });
+          const resume = parseCopilotResumeCursor(input.resumeCursor);
+          const persistedBinding = Option.getOrUndefined(
+            yield* readPersistedBinding(input.threadId),
+          );
+          const persistedState =
+            persistedBinding?.provider === PROVIDER
+              ? readPersistedCopilotState(persistedBinding.runtimePayload)
+              : undefined;
+          const restoredCurrentTurnId =
+            persistedState?.currentTurnId ??
+            (persistedBinding?.provider === PROVIDER
+              ? readPersistedActiveTurnId(persistedBinding.runtimePayload)
+              : undefined);
 
           const baseSessionConfig = {
             clientName: "t3-code",
@@ -2159,7 +2377,6 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
 
           const sdkSession = yield* Effect.gen(function* () {
             yield* copilotSdk.startClient(input.threadId, client);
-            const resume = parseCopilotResumeCursor(input.resumeCursor);
             if (resume) {
               return yield* copilotSdk.resumeSession(input.threadId, client, resume.sessionId, {
                 ...baseSessionConfig,
@@ -2192,12 +2409,17 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
               ...(modelSelection?.model ? { model: modelSelection.model } : {}),
               threadId: input.threadId,
               resumeCursor: toCopilotResumeCursor(sdkSession.sessionId),
+              ...(restoredCurrentTurnId ? { activeTurnId: restoredCurrentTurnId } : {}),
               createdAt: nowIso(),
               updatedAt: nowIso(),
             },
-            turns: [],
-            queuedTurnIds: [],
-            turnStartPayloadByTurnId: new Map(),
+            turns:
+              persistedState?.turns.map((turn) => ({
+                id: turn.id,
+                items: [...turn.items],
+              })) ?? [],
+            queuedTurnIds: [...(persistedState?.queuedTurnIds ?? [])],
+            turnStartPayloadByTurnId: new Map(persistedState?.turnStartPayloadByTurnId ?? []),
             sdkTurnIdsToTurnIds: new Map(),
             completedTurnIds: new Set(),
             turnUsageByTurnId: new Map(),
@@ -2210,14 +2432,17 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             toolMetaById: new Map(),
             turnIdByProviderItemId: new Map(),
             emittedTextByItemId: new Map(),
-            pendingTaskCompletionTextByTurnId: new Map(),
+            pendingTaskCompletionTextByTurnId: new Map(
+              persistedState?.pendingTaskCompletionTextByTurnId ?? [],
+            ),
             turnIdsWithAssistantText: new Set(),
             startedItemIds: new Set(),
             collaborationModeRef,
-            currentTurn: undefined,
+            currentTurn: restoredCurrentTurnId ? { turnId: restoredCurrentTurnId } : undefined,
             eventChain: Promise.resolve(),
             stopped: false,
           };
+          restorePersistedCopilotMappings(context);
           sessions.set(input.threadId, context);
 
           yield* syncSessionMode(
@@ -2320,6 +2545,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
         ensureTurnSnapshot(context, turnId);
         context.queuedTurnIds.push(turnId);
         context.turnStartPayloadByTurnId.set(turnId, turnStartPayload);
+        yield* persistSessionState(context);
 
         const messageOptions: MessageOptions = {
           prompt: text ?? "",
@@ -2336,6 +2562,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
               }
               context.turnStartPayloadByTurnId.delete(turnId);
               const nextActiveTurnId = currentTurnId(context);
+              yield* persistSessionState(context);
               if (isCopilotAbortLikeDetail(error.detail)) {
                 updateProviderSession(context, {
                   status: nextActiveTurnId ? "running" : "ready",
@@ -2410,7 +2637,20 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           decision === "accept" || decision === "acceptForSession"
             ? { kind: "approved" }
             : { kind: "denied-interactively-by-user" };
+        context.pendingPermissionBindings.delete(requestId);
         yield* Deferred.succeed(binding.deferred, result);
+        yield* emit({
+          ...createBaseEvent({
+            threadId: context.threadId,
+            requestId: binding.requestId,
+          }),
+          type: "request.resolved",
+          payload: {
+            requestType: binding.requestType,
+            decision: result.kind,
+            resolution: result,
+          },
+        });
       });
 
       const respondToUserInput: CopilotAdapterShape["respondToUserInput"] = Effect.fn(
@@ -2428,10 +2668,26 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
         }
 
         const response = answerFromUserInput(binding, answers);
+        context.pendingUserInputBindings.delete(requestId);
         yield* Deferred.succeed(binding.deferred, response);
+        yield* emit({
+          ...createBaseEvent({
+            threadId: context.threadId,
+            requestId: binding.requestId,
+          }),
+          type: "user-input.resolved",
+          payload: {
+            answers: {
+              answer: response.answer,
+              wasFreeform: response.wasFreeform,
+            },
+          },
+        });
       });
 
-      const stopSessionInternal = (threadId: ThreadId): Effect.Effect<void> =>
+      const stopSessionInternal = (
+        threadId: ThreadId,
+      ): Effect.Effect<void, ProviderAdapterProcessError> =>
         Effect.gen(function* () {
           const context = sessions.get(threadId);
           if (!context) {
@@ -2461,6 +2717,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             status: "closed",
             activeTurnId: undefined,
           });
+          yield* persistSessionState(context);
           yield* emit({
             ...createBaseEvent({
               threadId,

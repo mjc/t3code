@@ -494,10 +494,61 @@ function updateThreadSessionInSnapshot(
   };
 }
 
+function addPendingUserInputToSnapshot(
+  snapshot: OrchestrationReadModel,
+  threadId: ThreadId,
+): OrchestrationReadModel {
+  return {
+    ...snapshot,
+    snapshotSequence: snapshot.snapshotSequence + 1,
+    threads: snapshot.threads.map((thread) =>
+      thread.id === threadId
+        ? {
+            ...thread,
+            activities: [
+              ...thread.activities,
+              {
+                id: EventId.make(`activity-user-input-requested-${threadId}`),
+                tone: "info",
+                kind: "user-input.requested",
+                summary: "User input requested",
+                payload: {
+                  requestId: `req-pending-user-input-${threadId}`,
+                  questions: [
+                    {
+                      id: "scope",
+                      header: "Scope",
+                      question: "What should this change cover?",
+                      options: [
+                        {
+                          label: "Tight",
+                          description: "Touch only the footer layout logic.",
+                        },
+                        {
+                          label: "Broad",
+                          description: "Also adjust the related composer controls.",
+                        },
+                      ],
+                    },
+                  ],
+                },
+                turnId: null,
+                sequence: 1,
+                createdAt: isoAt(1_000),
+              },
+            ],
+            updatedAt: isoAt(1_000),
+          }
+        : thread,
+    ),
+  };
+}
+
 function sendShellThreadUpsert(
   threadId: ThreadId,
   options?: {
     readonly session?: OrchestrationReadModel["threads"][number]["session"];
+    readonly hasPendingUserInput?: boolean;
   },
 ): void {
   const thread = fixture.snapshot.threads.find((entry) => entry.id === threadId);
@@ -512,7 +563,10 @@ function sendShellThreadUpsert(
   rpcHarness.emitStreamValue(ORCHESTRATION_WS_METHODS.subscribeShell, {
     kind: "thread-upserted",
     sequence: fixture.snapshot.snapshotSequence,
-    thread: shellThread,
+    thread: {
+      ...shellThread,
+      hasPendingUserInput: options?.hasPendingUserInput ?? shellThread.hasPendingUserInput,
+    },
   });
 }
 
@@ -3678,6 +3732,48 @@ describe("ChatView timeline estimator parity (full app)", () => {
       );
 
       await expect.element(page.getByTestId("composer-editor")).toBeInTheDocument();
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("canonicalizes promoted drafts when the server thread already has pending user input", async () => {
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: createSnapshotForTargetUser({
+        targetMessageId: "msg-user-draft-pending-input-test" as MessageId,
+        targetText: "draft pending input test",
+      }),
+    });
+
+    try {
+      const newThreadButton = page.getByTestId("new-thread-button");
+      await expect.element(newThreadButton).toBeInTheDocument();
+
+      await newThreadButton.click();
+
+      const newThreadPath = await waitForURL(
+        mounted.router,
+        (path) => UUID_ROUTE_RE.test(path),
+        "Route should have changed to a promoted draft thread UUID.",
+      );
+      const newDraftId = draftIdFromPath(newThreadPath);
+      const newThreadId = draftThreadIdFor(newDraftId);
+
+      fixture.snapshot = addThreadToSnapshot(fixture.snapshot, newThreadId);
+      fixture.snapshot = addPendingUserInputToSnapshot(fixture.snapshot, newThreadId);
+      sendShellThreadUpsert(newThreadId, {
+        session: null,
+        hasPendingUserInput: true,
+      });
+
+      await waitForURL(
+        mounted.router,
+        (path) => path === serverThreadPath(newThreadId),
+        "Promoted drafts should canonicalize once the server thread is waiting on user input.",
+      );
+
+      await waitForButtonContainingText("Tight");
     } finally {
       await mounted.cleanup();
     }

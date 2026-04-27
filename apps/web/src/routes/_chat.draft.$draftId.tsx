@@ -5,7 +5,7 @@ import { threadHasStarted } from "../components/ChatView.logic";
 import { useComposerDraftStore, DraftId } from "../composerDraftStore";
 import { SidebarInset } from "../components/ui/sidebar";
 import { createThreadSelectorAcrossEnvironments } from "../storeSelectors";
-import { useStore } from "../store";
+import { selectSidebarThreadSummaryByRef, useStore } from "../store";
 import { buildThreadRouteParams } from "../threadRoutes";
 
 function DraftChatThreadRouteView() {
@@ -20,10 +20,21 @@ function DraftChatThreadRouteView() {
     ),
   );
   const serverThreadStarted = threadHasStarted(serverThread);
+  const promotedThreadSummary = useStore(
+    useMemo(
+      () => (state) => selectSidebarThreadSummaryByRef(state, draftSession?.promotedTo ?? null),
+      [draftSession?.promotedTo],
+    ),
+  );
+  const promotedThreadHasBlockingRuntimeState = Boolean(
+    promotedThreadSummary?.hasPendingApprovals ||
+    promotedThreadSummary?.hasPendingUserInput ||
+    promotedThreadSummary?.hasActionableProposedPlan,
+  );
   const canonicalThreadRef = useMemo(
     () =>
       draftSession?.promotedTo
-        ? serverThreadStarted
+        ? serverThreadStarted || promotedThreadHasBlockingRuntimeState
           ? draftSession.promotedTo
           : null
         : serverThread
@@ -32,7 +43,12 @@ function DraftChatThreadRouteView() {
               threadId: serverThread.id,
             }
           : null,
-    [draftSession?.promotedTo, serverThread, serverThreadStarted],
+    [
+      draftSession?.promotedTo,
+      promotedThreadHasBlockingRuntimeState,
+      serverThread,
+      serverThreadStarted,
+    ],
   );
 
   useEffect(() => {

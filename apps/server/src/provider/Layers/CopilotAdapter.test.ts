@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import type {
@@ -9,17 +12,23 @@ import type {
   SessionEvent,
 } from "@github/copilot-sdk";
 import { it } from "@effect/vitest";
-import { Effect, Layer } from "effect";
+import { Effect, Layer, Option } from "effect";
 import { beforeEach, vi } from "vitest";
 
-import { ThreadId } from "@t3tools/contracts";
+import { ApprovalRequestId, ThreadId } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
+import { ProviderSessionRuntimeRepositoryLive } from "../../persistence/Layers/ProviderSessionRuntime.ts";
+import { makeSqlitePersistenceLive } from "../../persistence/Layers/Sqlite.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import { ProviderSessionDirectoryPersistenceError } from "../Errors.ts";
 import { CopilotAdapter } from "../Services/CopilotAdapter.ts";
+import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import { makeCopilotAdapterLive } from "./CopilotAdapter.ts";
+import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 
 const asThreadId = (value: string): ThreadId => ThreadId.make(value);
+const asApprovalRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make(value);
 const waitForSdkEventQueue = () =>
   Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, 10)));
 
@@ -44,7 +53,11 @@ const runtimeMock = vi.hoisted(() => {
     startCalls: 0,
     stopCalls: 0,
     createSessionConfigs: [] as SessionConfig[],
+    resumeSessionConfigs: [] as Array<{ sessionId: string; config: SessionConfig }>,
     createSessionImpl: null as ((config: SessionConfig) => Promise<CopilotSession>) | null,
+    resumeSessionImpl: null as
+      | ((sessionId: string, config: SessionConfig) => Promise<CopilotSession>)
+      | null,
     lastSession: makeSession(),
   };
 
@@ -54,8 +67,10 @@ const runtimeMock = vi.hoisted(() => {
       state.startCalls = 0;
       state.stopCalls = 0;
       state.createSessionConfigs.length = 0;
+      state.resumeSessionConfigs.length = 0;
       state.lastSession = makeSession();
       state.createSessionImpl = async () => state.lastSession as unknown as CopilotSession;
+      state.resumeSessionImpl = async () => state.lastSession as unknown as CopilotSession;
     },
   };
 });
@@ -81,8 +96,12 @@ vi.mock("../copilotRuntime.ts", async () => {
               config,
             );
           }),
-          resumeSession: vi.fn(async () => {
-            throw new Error("resumeSession is not used in CopilotAdapter tests");
+          resumeSession: vi.fn(async (sessionId: string, config: SessionConfig) => {
+            runtimeMock.state.resumeSessionConfigs.push({ sessionId, config });
+            return (runtimeMock.state.resumeSessionImpl ?? (async () => undefined as never))(
+              sessionId,
+              config,
+            );
           }),
         }) as unknown as CopilotClient,
     ),
@@ -93,19 +112,35 @@ beforeEach(() => {
   runtimeMock.reset();
 });
 
-const CopilotAdapterTestLayer = makeCopilotAdapterLive().pipe(
-  Layer.provideMerge(
-    ServerConfig.layerTest(process.cwd(), {
-      prefix: "t3code-copilot-adapter-test-",
-    }),
-  ),
+const CopilotAdapterPersistenceLayer = Layer.succeed(ProviderSessionDirectory, {
+  upsert: () => Effect.void,
+  getProvider: () =>
+    Effect.fail(
+      new ProviderSessionDirectoryPersistenceError({
+        operation: "CopilotAdapter.test.getProvider",
+        detail: "provider lookup is not used in CopilotAdapter tests",
+      }),
+    ),
+  getBinding: () => Effect.succeed(Option.none()),
+  listThreadIds: () => Effect.succeed([]),
+  listBindings: () => Effect.succeed([]),
+});
+
+const CopilotAdapterBaseTestLayer = ServerConfig.layerTest(process.cwd(), {
+  prefix: "t3code-copilot-adapter-test-",
+}).pipe(
   Layer.provideMerge(
     ServerSettingsService.layerTest({ providers: { copilot: { enabled: true } } }),
   ),
   Layer.provideMerge(NodeServices.layer),
 );
 
-it.layer(CopilotAdapterTestLayer)("CopilotAdapterLive", (it) => {
+const CopilotAdapterTestLayer = makeCopilotAdapterLive().pipe(
+  Layer.provideMerge(CopilotAdapterPersistenceLayer),
+  Layer.provideMerge(CopilotAdapterBaseTestLayer),
+);
+
+it.layer(NodeServices.layer)("CopilotAdapterLive", (it) => {
   it.effect(
     "denies bootstrap permission requests before the session context exists in approval-required mode",
     () =>
@@ -119,7 +154,9 @@ it.layer(CopilotAdapterTestLayer)("CopilotAdapterLive", (it) => {
           return runtimeMock.state.lastSession as unknown as CopilotSession;
         };
 
-        const adapter = yield* CopilotAdapter;
+        const adapter = yield* Effect.service(CopilotAdapter).pipe(
+          Effect.provide(CopilotAdapterTestLayer),
+        );
         const threadId = asThreadId("copilot-bootstrap-permission-denied");
 
         const session = yield* adapter.startSession({
@@ -147,7 +184,9 @@ it.layer(CopilotAdapterTestLayer)("CopilotAdapterLive", (it) => {
           return runtimeMock.state.lastSession as unknown as CopilotSession;
         };
 
-        const adapter = yield* CopilotAdapter;
+        const adapter = yield* Effect.service(CopilotAdapter).pipe(
+          Effect.provide(CopilotAdapterTestLayer),
+        );
         const threadId = asThreadId("copilot-bootstrap-permission-approved");
 
         const session = yield* adapter.startSession({
@@ -183,7 +222,9 @@ it.layer(CopilotAdapterTestLayer)("CopilotAdapterLive", (it) => {
           return runtimeMock.state.lastSession as unknown as CopilotSession;
         };
 
-        const adapter = yield* CopilotAdapter;
+        const adapter = yield* Effect.service(CopilotAdapter).pipe(
+          Effect.provide(CopilotAdapterTestLayer),
+        );
         const threadId = asThreadId("copilot-bootstrap-user-input");
 
         const session = yield* adapter.startSession({
@@ -200,7 +241,9 @@ it.layer(CopilotAdapterTestLayer)("CopilotAdapterLive", (it) => {
 
   it.effect("switches the injected Copilot developer instructions with plan mode", () =>
     Effect.gen(function* () {
-      const adapter = yield* CopilotAdapter;
+      const adapter = yield* Effect.service(CopilotAdapter).pipe(
+        Effect.provide(CopilotAdapterTestLayer),
+      );
       const threadId = asThreadId("copilot-plan-mode-instructions");
 
       yield* adapter.startSession({
@@ -250,7 +293,9 @@ it.layer(CopilotAdapterTestLayer)("CopilotAdapterLive", (it) => {
     "renders Copilot Task_complete tool output as assistant text when no assistant message arrives",
     () =>
       Effect.gen(function* () {
-        const adapter = yield* CopilotAdapter;
+        const adapter = yield* Effect.service(CopilotAdapter).pipe(
+          Effect.provide(CopilotAdapterTestLayer),
+        );
         const threadId = asThreadId("copilot-task-complete-assistant-fallback");
 
         yield* adapter.startSession({
@@ -355,7 +400,9 @@ it.layer(CopilotAdapterTestLayer)("CopilotAdapterLive", (it) => {
 
   it.effect("keeps Copilot turns queued until the SDK reports assistant.turn_start", () =>
     Effect.gen(function* () {
-      const adapter = yield* CopilotAdapter;
+      const adapter = yield* Effect.service(CopilotAdapter).pipe(
+        Effect.provide(CopilotAdapterTestLayer),
+      );
       const threadId = asThreadId("copilot-turn-start-driven-running-state");
 
       yield* adapter.startSession({
@@ -401,7 +448,9 @@ it.layer(CopilotAdapterTestLayer)("CopilotAdapterLive", (it) => {
 
   it.effect("maps queued Copilot turns to SDK turn_start events in order", () =>
     Effect.gen(function* () {
-      const adapter = yield* CopilotAdapter;
+      const adapter = yield* Effect.service(CopilotAdapter).pipe(
+        Effect.provide(CopilotAdapterTestLayer),
+      );
       const threadId = asThreadId("copilot-queued-turn-order");
 
       yield* adapter.startSession({
@@ -515,9 +564,385 @@ it.layer(CopilotAdapterTestLayer)("CopilotAdapterLive", (it) => {
     }),
   );
 
+  it.effect("cleans up pending permission bindings as soon as a reply is sent", () =>
+    Effect.gen(function* () {
+      const adapter = yield* Effect.service(CopilotAdapter).pipe(
+        Effect.provide(CopilotAdapterTestLayer),
+      );
+      const threadId = asThreadId("copilot-permission-binding-cleanup");
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+
+      const config = runtimeMock.state.createSessionConfigs.at(-1);
+      assert.ok(config?.onEvent);
+
+      const permissionRequestPromise = config.onPermissionRequest!(
+        {
+          kind: "shell",
+          toolCallId: "tool-call-permission-1",
+          fullCommandText: "echo hello",
+          intention: "Run a command",
+        } as PermissionRequest,
+        { sessionId: runtimeMock.state.lastSession.sessionId },
+      );
+
+      config.onEvent?.({
+        id: "evt-copilot-permission-requested",
+        timestamp: new Date().toISOString(),
+        parentId: null,
+        type: "permission.requested",
+        data: {
+          requestId: "permission-request-1",
+          resolvedByHook: false,
+          permissionRequest: {
+            kind: "shell",
+            toolCallId: "tool-call-permission-1",
+            fullCommandText: "echo hello",
+            intention: "Run a command",
+          },
+        },
+      } as SessionEvent);
+
+      yield* waitForSdkEventQueue();
+      yield* adapter.respondToRequest(
+        threadId,
+        asApprovalRequestId("permission-request-1"),
+        "accept",
+      );
+      assert.deepStrictEqual(
+        yield* Effect.promise(() => Promise.resolve(permissionRequestPromise)),
+        {
+          kind: "approved",
+        },
+      );
+
+      const repeatedPermissionReply = yield* Effect.exit(
+        adapter.respondToRequest(threadId, asApprovalRequestId("permission-request-1"), "accept"),
+      );
+      assert.equal(repeatedPermissionReply._tag, "Failure");
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("cleans up pending user-input bindings as soon as a reply is sent", () =>
+    Effect.gen(function* () {
+      const adapter = yield* Effect.service(CopilotAdapter).pipe(
+        Effect.provide(CopilotAdapterTestLayer),
+      );
+      const threadId = asThreadId("copilot-user-input-binding-cleanup");
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+
+      const config = runtimeMock.state.createSessionConfigs.at(-1);
+      assert.ok(config?.onUserInputRequest);
+
+      const userInputRequestPromise = config.onUserInputRequest!(
+        {
+          question: "How should Copilot continue?",
+          choices: ["Continue", "Stop"],
+          allowFreeform: true,
+        },
+        { sessionId: runtimeMock.state.lastSession.sessionId },
+      );
+
+      config.onEvent?.({
+        id: "evt-copilot-user-input-requested",
+        timestamp: new Date().toISOString(),
+        parentId: null,
+        type: "user_input.requested",
+        data: {
+          requestId: "user-input-request-1",
+          question: "How should Copilot continue?",
+          choices: ["Continue", "Stop"],
+          allowFreeform: true,
+        },
+      } as SessionEvent);
+
+      yield* waitForSdkEventQueue();
+      yield* adapter.respondToUserInput(threadId, asApprovalRequestId("user-input-request-1"), {
+        answer: "Continue",
+        wasFreeform: false,
+      });
+      assert.deepStrictEqual(
+        yield* Effect.promise(() => Promise.resolve(userInputRequestPromise)),
+        {
+          answer: "Continue",
+          wasFreeform: false,
+        },
+      );
+
+      const repeatedUserInputReply = yield* Effect.exit(
+        adapter.respondToUserInput(threadId, asApprovalRequestId("user-input-request-1"), {
+          answer: "Continue",
+          wasFreeform: false,
+        }),
+      );
+      assert.equal(repeatedUserInputReply._tag, "Failure");
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("restores Copilot thread, active turn, and queued turn ids after restart", () =>
+    Effect.gen(function* () {
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "t3-copilot-restart-"));
+      const dbPath = path.join(tempDir, "orchestration.sqlite");
+      const persistenceLayer = makeSqlitePersistenceLive(dbPath);
+      const runtimeRepositoryLayer = ProviderSessionRuntimeRepositoryLive.pipe(
+        Layer.provide(persistenceLayer),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const firstAdapterLayer = makeCopilotAdapterLive().pipe(
+        Layer.provideMerge(directoryLayer),
+        Layer.provideMerge(CopilotAdapterBaseTestLayer),
+      );
+      const secondAdapterLayer = makeCopilotAdapterLive().pipe(
+        Layer.provideMerge(directoryLayer),
+        Layer.provideMerge(CopilotAdapterBaseTestLayer),
+      );
+      const threadId = asThreadId("copilot-restart-restores-session-state");
+
+      runtimeMock.state.createSessionImpl = async (config) => {
+        config.onEvent?.({
+          id: "evt-copilot-start-restart",
+          timestamp: new Date().toISOString(),
+          parentId: null,
+          type: "session.start",
+          data: {
+            sessionId: runtimeMock.state.lastSession.sessionId,
+            selectedModel: "gpt-4.1",
+            context: { cwd: process.cwd() },
+          },
+        } as SessionEvent);
+        return runtimeMock.state.lastSession as unknown as CopilotSession;
+      };
+
+      const { session, firstTurn, secondTurn, thirdTurn } = yield* Effect.gen(function* () {
+        const firstAdapter = yield* Effect.service(CopilotAdapter);
+        const session = yield* firstAdapter.startSession({
+          provider: "copilot",
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "approval-required",
+        });
+
+        const firstTurn = yield* firstAdapter.sendTurn({
+          threadId,
+          input: "first",
+          attachments: [],
+        });
+
+        const config = runtimeMock.state.createSessionConfigs.at(-1);
+        assert.ok(config?.onEvent);
+        config.onEvent?.({
+          id: "evt-copilot-turn-start-1",
+          timestamp: new Date().toISOString(),
+          parentId: null,
+          type: "assistant.turn_start",
+          data: {
+            turnId: "sdk-turn-1",
+          },
+        } as SessionEvent);
+        config.onEvent?.({
+          id: "evt-copilot-message-1",
+          timestamp: new Date().toISOString(),
+          parentId: null,
+          type: "assistant.message",
+          data: {
+            messageId: "message-1",
+            content: "first result",
+          },
+        } as SessionEvent);
+        config.onEvent?.({
+          id: "evt-copilot-turn-end-1",
+          timestamp: new Date().toISOString(),
+          parentId: null,
+          type: "assistant.turn_end",
+          data: {
+            turnId: "sdk-turn-1",
+          },
+        } as SessionEvent);
+
+        const secondTurn = yield* firstAdapter.sendTurn({
+          threadId,
+          input: "second",
+          attachments: [],
+        });
+        config.onEvent?.({
+          id: "evt-copilot-turn-start-2",
+          timestamp: new Date().toISOString(),
+          parentId: null,
+          type: "assistant.turn_start",
+          data: {
+            turnId: "sdk-turn-2",
+          },
+        } as SessionEvent);
+
+        const thirdTurn = yield* firstAdapter.sendTurn({
+          threadId,
+          input: "third",
+          attachments: [],
+        });
+
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          yield* waitForSdkEventQueue();
+        }
+
+        return { session, firstTurn, secondTurn, thirdTurn } as const;
+      }).pipe(Effect.provide(firstAdapterLayer));
+
+      runtimeMock.state.resumeSessionImpl = async (sessionId, resumeConfig) => {
+        assert.equal(sessionId, runtimeMock.state.lastSession.sessionId);
+        resumeConfig.onEvent?.({
+          id: "evt-copilot-session-resume",
+          timestamp: new Date().toISOString(),
+          parentId: null,
+          type: "session.resume",
+          data: {
+            selectedModel: "gpt-4.1",
+            context: { cwd: process.cwd() },
+          },
+        } as SessionEvent);
+        return runtimeMock.state.lastSession as unknown as CopilotSession;
+      };
+
+      yield* Effect.gen(function* () {
+        const secondAdapter = yield* Effect.service(CopilotAdapter);
+        yield* secondAdapter.startSession({
+          provider: "copilot",
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "approval-required",
+          resumeCursor: session.resumeCursor,
+        });
+
+        let resumedSession = (yield* secondAdapter.listSessions()).find(
+          (entry) => entry.threadId === threadId,
+        );
+        assert.ok(resumedSession);
+        assert.equal(resumedSession.activeTurnId, secondTurn.turnId);
+
+        let thread = yield* secondAdapter.readThread(threadId);
+        const restoredFirstTurn = thread.turns.find((entry) => entry.id === firstTurn.turnId);
+        assert.ok(restoredFirstTurn);
+        assert.ok(
+          restoredFirstTurn.items.some(
+            (item) =>
+              typeof item === "object" &&
+              item !== null &&
+              "messageId" in item &&
+              item.messageId === "message-1",
+          ),
+        );
+        assert.ok(thread.turns.some((entry) => entry.id === thirdTurn.turnId));
+
+        const resumeConfig = runtimeMock.state.resumeSessionConfigs.at(-1)?.config;
+        assert.ok(resumeConfig?.onEvent);
+        resumeConfig.onEvent?.({
+          id: "evt-copilot-message-2",
+          timestamp: new Date().toISOString(),
+          parentId: null,
+          type: "assistant.message",
+          data: {
+            messageId: "message-2",
+            content: "second result",
+          },
+        } as SessionEvent);
+        resumeConfig.onEvent?.({
+          id: "evt-copilot-turn-end-2",
+          timestamp: new Date().toISOString(),
+          parentId: null,
+          type: "assistant.turn_end",
+          data: {
+            turnId: "sdk-turn-2",
+          },
+        } as SessionEvent);
+        resumeConfig.onEvent?.({
+          id: "evt-copilot-turn-start-3",
+          timestamp: new Date().toISOString(),
+          parentId: null,
+          type: "assistant.turn_start",
+          data: {
+            turnId: "sdk-turn-3",
+          },
+        } as SessionEvent);
+        resumeConfig.onEvent?.({
+          id: "evt-copilot-message-3",
+          timestamp: new Date().toISOString(),
+          parentId: null,
+          type: "assistant.message",
+          data: {
+            messageId: "message-3",
+            content: "third result",
+          },
+        } as SessionEvent);
+        resumeConfig.onEvent?.({
+          id: "evt-copilot-turn-end-3",
+          timestamp: new Date().toISOString(),
+          parentId: null,
+          type: "assistant.turn_end",
+          data: {
+            turnId: "sdk-turn-3",
+          },
+        } as SessionEvent);
+
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          yield* waitForSdkEventQueue();
+        }
+
+        thread = yield* secondAdapter.readThread(threadId);
+        const restoredSecondTurn = thread.turns.find((entry) => entry.id === secondTurn.turnId);
+        const restoredThirdTurn = thread.turns.find((entry) => entry.id === thirdTurn.turnId);
+        assert.ok(restoredSecondTurn);
+        assert.ok(restoredThirdTurn);
+        assert.ok(
+          restoredSecondTurn.items.some(
+            (item) =>
+              typeof item === "object" &&
+              item !== null &&
+              "messageId" in item &&
+              item.messageId === "message-2",
+          ),
+        );
+        assert.ok(
+          restoredThirdTurn.items.some(
+            (item) =>
+              typeof item === "object" &&
+              item !== null &&
+              "messageId" in item &&
+              item.messageId === "message-3",
+          ),
+        );
+
+        resumedSession = (yield* secondAdapter.listSessions()).find(
+          (entry) => entry.threadId === threadId,
+        );
+        assert.ok(resumedSession);
+        assert.equal(resumedSession.activeTurnId, undefined);
+
+        yield* secondAdapter.stopSession(threadId);
+      }).pipe(Effect.provide(secondAdapterLayer));
+    }),
+  );
+
   it.effect("does not clear the running turn until the SDK abort event arrives", () =>
     Effect.gen(function* () {
-      const adapter = yield* CopilotAdapter;
+      const adapter = yield* Effect.service(CopilotAdapter).pipe(
+        Effect.provide(CopilotAdapterTestLayer),
+      );
       const threadId = asThreadId("copilot-interrupt-waits-for-sdk-abort");
 
       yield* adapter.startSession({
@@ -577,7 +1002,9 @@ it.layer(CopilotAdapterTestLayer)("CopilotAdapterLive", (it) => {
 
   it.effect("aborts an active Copilot turn before stopping the session", () =>
     Effect.gen(function* () {
-      const adapter = yield* CopilotAdapter;
+      const adapter = yield* Effect.service(CopilotAdapter).pipe(
+        Effect.provide(CopilotAdapterTestLayer),
+      );
       const threadId = asThreadId("copilot-stop-session-aborts-active-turn");
 
       yield* adapter.startSession({
@@ -617,7 +1044,9 @@ it.layer(CopilotAdapterTestLayer)("CopilotAdapterLive", (it) => {
     Effect.gen(function* () {
       runtimeMock.state.lastSession.send.mockRejectedValueOnce(new Error("aborted"));
 
-      const adapter = yield* CopilotAdapter;
+      const adapter = yield* Effect.service(CopilotAdapter).pipe(
+        Effect.provide(CopilotAdapterTestLayer),
+      );
       const threadId = asThreadId("copilot-send-aborted-without-session-error");
 
       yield* adapter.startSession({
