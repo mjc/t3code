@@ -291,6 +291,20 @@ function detailFromCause(cause: unknown, fallback: string): string {
   return cause instanceof Error && cause.message.trim().length > 0 ? cause.message : fallback;
 }
 
+function isCopilotAbortLikeDetail(detail: string | undefined): boolean {
+  const normalized = detail?.trim().toLowerCase();
+  if (!normalized) {
+    return false;
+  }
+
+  return (
+    normalized === "aborted" ||
+    normalized === "aborterror" ||
+    normalized.includes("request was aborted") ||
+    normalized.includes("interrupted by user")
+  );
+}
+
 function requireSessionContext(
   sessions: ReadonlyMap<ThreadId, CopilotSessionContext>,
   threadId: ThreadId,
@@ -454,11 +468,25 @@ function userInputSignature(input: {
 
 function updateProviderSession(
   context: CopilotSessionContext,
-  patch: Partial<ProviderSession>,
+  patch: Omit<Partial<ProviderSession>, "lastError"> & {
+    readonly lastError?: string | null | undefined;
+  },
 ): void {
+  if (patch.lastError === null) {
+    const { lastError: _lastError, ...nextSession } = {
+      ...context.session,
+      ...patch,
+      updatedAt: nowIso(),
+    };
+    context.session = nextSession;
+    return;
+  }
+
+  const { lastError, ...restPatch } = patch;
   context.session = {
     ...context.session,
-    ...patch,
+    ...restPatch,
+    ...(lastError !== undefined ? { lastError } : {}),
     updatedAt: nowIso(),
   };
 }
@@ -909,7 +937,9 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
         }
         updateProviderSession(context, {
           status: status === "failed" ? "error" : context.stopped ? "closed" : "ready",
-          ...(status === "failed" && input?.errorMessage ? { lastError: input.errorMessage } : {}),
+          ...(status === "failed"
+            ? { lastError: input?.errorMessage ?? context.session.lastError ?? null }
+            : { lastError: null }),
           activeTurnId: undefined,
         });
         await emitAsync({
@@ -2250,6 +2280,24 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
                 context.queuedTurnIds.splice(queueIndex, 1);
               }
               context.activeTurnId = undefined;
+              if (isCopilotAbortLikeDetail(error.detail)) {
+                updateProviderSession(context, {
+                  status: "ready",
+                  activeTurnId: undefined,
+                  lastError: null,
+                });
+                return yield* emit({
+                  ...createBaseEvent({
+                    threadId: input.threadId,
+                    turnId,
+                  }),
+                  type: "turn.completed",
+                  payload: {
+                    state: "cancelled",
+                    stopReason: "aborted",
+                  },
+                });
+              }
               updateProviderSession(context, {
                 status: "ready",
                 activeTurnId: undefined,

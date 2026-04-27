@@ -352,4 +352,36 @@ it.layer(CopilotAdapterTestLayer)("CopilotAdapterLive", (it) => {
         yield* adapter.stopSession(threadId);
       }),
   );
+
+  it.effect("treats bare aborted send failures as cancelled without leaving a session error", () =>
+    Effect.gen(function* () {
+      runtimeMock.state.lastSession.send.mockRejectedValueOnce(new Error("aborted"));
+
+      const adapter = yield* CopilotAdapter;
+      const threadId = asThreadId("copilot-send-aborted-without-session-error");
+
+      yield* adapter.startSession({
+        provider: "copilot",
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "hello",
+        attachments: [],
+      });
+
+      assert.ok(turn.turnId);
+
+      const session = (yield* adapter.listSessions()).find((entry) => entry.threadId === threadId);
+      assert.ok(session);
+      assert.equal(session.status, "ready");
+      assert.equal(session.activeTurnId, undefined);
+      assert.equal(session.lastError, undefined);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
 });
