@@ -860,6 +860,10 @@ function currentSdkTurnId(context: CopilotSessionContext): string | undefined {
   return context.currentTurn?.sdkTurnId;
 }
 
+function currentTurnIsConfirmed(context: CopilotSessionContext): boolean {
+  return currentSdkTurnId(context) !== undefined;
+}
+
 function setCurrentTurn(
   context: CopilotSessionContext,
   input: {
@@ -1594,11 +1598,11 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           }
           case "session.resume": {
             updateProviderSession(context, {
-              status: currentTurnId(context) ? "running" : "ready",
+              status: "ready",
               model: trimOrUndefined(event.data.selectedModel) ?? context.session.model,
               ...(event.data.context?.cwd ? { cwd: event.data.context.cwd } : {}),
               resumeCursor: toCopilotResumeCursor(context.sdkSession.sessionId),
-              activeTurnId: currentTurnId(context),
+              activeTurnId: undefined,
             });
             await persistSessionStateAsync(context);
             await emitAsync({
@@ -1689,23 +1693,23 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             return;
           }
           case "session.idle": {
-            if (currentTurnId(context)) {
+            const turnId = currentTurnId(context);
+            if (turnId && currentTurnIsConfirmed(context)) {
               if (!event.data.aborted) {
-                await emitPendingTaskCompletionAsAssistantMessage(
-                  context,
-                  currentTurnId(context)!,
-                  event,
-                );
+                await emitPendingTaskCompletionAsAssistantMessage(context, turnId, event);
               }
               await emitTurnCompleted(
                 context,
-                currentTurnId(context)!,
+                turnId,
                 event.data.aborted ? "cancelled" : "completed",
                 {
                   raw: event,
                   stopReason: event.data.aborted ? "aborted" : null,
                 },
               );
+            } else if (turnId) {
+              clearCurrentTurn(context, turnId);
+              await persistSessionStateAsync(context);
             }
             updateProviderSession(context, {
               status: context.stopped ? "closed" : "ready",
@@ -2034,6 +2038,15 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           case "abort": {
             const turnId = currentTurnId(context);
             if (!turnId) {
+              return;
+            }
+            if (!currentTurnIsConfirmed(context)) {
+              clearCurrentTurn(context, turnId);
+              updateProviderSession(context, {
+                status: context.stopped ? "closed" : "ready",
+                activeTurnId: undefined,
+              });
+              await persistSessionStateAsync(context);
               return;
             }
             await emitAsync({

@@ -138,52 +138,56 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
         </div>
       </div>
       <p className="mt-1.5 text-sm text-foreground/90">{activeQuestion.question}</p>
-      {activeQuestion.multiSelect ? (
+      {activeQuestion.options.length === 0 ? (
+        <p className="mt-1 text-xs text-muted-foreground/65">Type your answer below.</p>
+      ) : activeQuestion.multiSelect ? (
         <p className="mt-1 text-xs text-muted-foreground/65">Select one or more options.</p>
       ) : null}
-      <div className="mt-3 space-y-1">
-        {activeQuestion.options.map((option, index) => {
-          const isSelected = progress.selectedOptionLabels.includes(option.label);
-          const shortcutKey = index < 9 ? index + 1 : null;
-          return (
-            <button
-              key={`${activeQuestion.id}:${option.label}`}
-              type="button"
-              disabled={isResponding}
-              onClick={() => handleOptionSelection(activeQuestion.id, option.label)}
-              className={cn(
-                "group flex w-full items-center gap-3 rounded-lg border px-3 py-2 text-left transition-all duration-150",
-                isSelected
-                  ? "border-blue-500/40 bg-blue-500/8 text-foreground"
-                  : "border-transparent bg-muted/20 text-foreground/80 hover:bg-muted/40 hover:border-border/40",
-                isResponding && "opacity-50 cursor-not-allowed",
-              )}
-            >
-              {shortcutKey !== null ? (
-                <kbd
-                  className={cn(
-                    "flex size-5 shrink-0 items-center justify-center rounded text-[11px] font-medium tabular-nums transition-colors duration-150",
-                    isSelected
-                      ? "bg-blue-500/20 text-blue-400"
-                      : "bg-muted/40 text-muted-foreground/50 group-hover:bg-muted/60 group-hover:text-muted-foreground/70",
-                  )}
-                >
-                  {shortcutKey}
-                </kbd>
-              ) : null}
-              <div className="min-w-0 flex-1">
-                <span className="text-sm font-medium">{option.label}</span>
-                {option.description && option.description !== option.label ? (
-                  <span className="ml-2 text-xs text-muted-foreground/50">
-                    {option.description}
-                  </span>
+      {activeQuestion.options.length > 0 ? (
+        <div className="mt-3 space-y-1">
+          {activeQuestion.options.map((option, index) => {
+            const isSelected = progress.selectedOptionLabels.includes(option.label);
+            const shortcutKey = index < 9 ? index + 1 : null;
+            return (
+              <button
+                key={`${activeQuestion.id}:${option.label}`}
+                type="button"
+                disabled={isResponding}
+                onClick={() => handleOptionSelection(activeQuestion.id, option.label)}
+                className={cn(
+                  "group flex w-full items-center gap-3 rounded-lg border px-3 py-2 text-left transition-all duration-150",
+                  isSelected
+                    ? "border-blue-500/40 bg-blue-500/8 text-foreground"
+                    : "border-transparent bg-muted/20 text-foreground/80 hover:bg-muted/40 hover:border-border/40",
+                  isResponding && "opacity-50 cursor-not-allowed",
+                )}
+              >
+                {shortcutKey !== null ? (
+                  <kbd
+                    className={cn(
+                      "flex size-5 shrink-0 items-center justify-center rounded text-[11px] font-medium tabular-nums transition-colors duration-150",
+                      isSelected
+                        ? "bg-blue-500/20 text-blue-400"
+                        : "bg-muted/40 text-muted-foreground/50 group-hover:bg-muted/60 group-hover:text-muted-foreground/70",
+                    )}
+                  >
+                    {shortcutKey}
+                  </kbd>
                 ) : null}
-              </div>
-              {isSelected ? <CheckIcon className="size-3.5 shrink-0 text-blue-400" /> : null}
-            </button>
-          );
-        })}
-      </div>
+                <div className="min-w-0 flex-1">
+                  <span className="text-sm font-medium">{option.label}</span>
+                  {option.description && option.description !== option.label ? (
+                    <span className="ml-2 text-xs text-muted-foreground/50">
+                      {option.description}
+                    </span>
+                  ) : null}
+                </div>
+                {isSelected ? <CheckIcon className="size-3.5 shrink-0 text-blue-400" /> : null}
+              </button>
+            );
+          })}
+        </div>
+      ) : null}
     </div>
   );
 });

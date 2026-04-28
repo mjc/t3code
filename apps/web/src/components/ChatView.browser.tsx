@@ -937,6 +937,46 @@ function createSnapshotWithPendingUserInput(): OrchestrationReadModel {
   };
 }
 
+function createSnapshotWithFreeformPendingUserInput(): OrchestrationReadModel {
+  const snapshot = createSnapshotForTargetUser({
+    targetMessageId: "msg-user-freeform-pending-input-target" as MessageId,
+    targetText: "freeform question thread",
+  });
+
+  return {
+    ...snapshot,
+    threads: snapshot.threads.map((thread) =>
+      thread.id === THREAD_ID
+        ? Object.assign({}, thread, {
+            activities: [
+              {
+                id: EventId.make("activity-user-input-requested-freeform"),
+                tone: "info",
+                kind: "user-input.requested",
+                summary: "User input requested",
+                payload: {
+                  requestId: "req-browser-user-input-freeform",
+                  questions: [
+                    {
+                      id: "answer",
+                      header: "Input",
+                      question: "What path should Copilot use?",
+                      options: [],
+                    },
+                  ],
+                },
+                turnId: null,
+                sequence: 1,
+                createdAt: isoAt(1_000),
+              },
+            ],
+            updatedAt: isoAt(1_000),
+          })
+        : thread,
+    ),
+  };
+}
+
 function createSnapshotWithPlanFollowUpPrompt(options?: {
   modelSelection?: { provider: "codex"; model: string };
   planMarkdown?: string;
@@ -5406,6 +5446,64 @@ describe("ChatView timeline estimator parity (full app)", () => {
 
       await mounted.setContainerSize(COMPACT_FOOTER_VIEWPORT);
       await expectComposerActionsContained();
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("renders and submits freeform pending user input on first mount", async () => {
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: createSnapshotWithFreeformPendingUserInput(),
+      resolveRpc: (body) => {
+        if (body._tag === ORCHESTRATION_WS_METHODS.dispatchCommand) {
+          return {
+            sequence: fixture.snapshot.snapshotSequence + 1,
+          };
+        }
+        return undefined;
+      },
+    });
+
+    try {
+      await vi.waitFor(
+        () => {
+          expect(document.body.textContent).toContain("What path should Copilot use?");
+          expect(document.body.textContent).toContain("Type your answer below.");
+        },
+        { timeout: 8_000, interval: 16 },
+      );
+
+      await page.getByTestId("composer-editor").fill("src/cli");
+      await waitForButtonContainingText("Submit");
+      await page.getByRole("button", { name: /submit/i }).click();
+
+      await vi.waitFor(
+        () => {
+          const dispatchRequest = wsRequests.find(
+            (request) =>
+              request._tag === ORCHESTRATION_WS_METHODS.dispatchCommand &&
+              request.type === "thread.user-input.respond",
+          ) as
+            | {
+                _tag: string;
+                type?: string;
+                requestId?: string;
+                answers?: Record<string, unknown>;
+              }
+            | undefined;
+
+          expect(dispatchRequest).toMatchObject({
+            _tag: ORCHESTRATION_WS_METHODS.dispatchCommand,
+            type: "thread.user-input.respond",
+            requestId: "req-browser-user-input-freeform",
+            answers: {
+              answer: "src/cli",
+            },
+          });
+        },
+        { timeout: 8_000, interval: 16 },
+      );
     } finally {
       await mounted.cleanup();
     }

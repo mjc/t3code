@@ -262,6 +262,46 @@ describe("derivePendingUserInputs", () => {
     ]);
   });
 
+  it("keeps freeform prompts with no predefined options", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "user-input-open-freeform",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        kind: "user-input.requested",
+        summary: "User input requested",
+        tone: "info",
+        payload: {
+          requestId: "req-user-input-freeform-1",
+          questions: [
+            {
+              id: "answer",
+              header: "Input",
+              question: "What path should Copilot use?",
+              options: [],
+              multiSelect: false,
+            },
+          ],
+        },
+      }),
+    ];
+
+    expect(derivePendingUserInputs(activities)).toEqual([
+      {
+        requestId: "req-user-input-freeform-1",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        questions: [
+          {
+            id: "answer",
+            header: "Input",
+            question: "What path should Copilot use?",
+            options: [],
+            multiSelect: false,
+          },
+        ],
+      },
+    ]);
+  });
+
   it("clears stale pending user-input prompts when the provider reports an orphaned request", () => {
     const activities: OrchestrationThreadActivity[] = [
       makeActivity({
