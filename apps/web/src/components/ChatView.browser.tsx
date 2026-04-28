@@ -126,6 +126,13 @@ const WIDE_FOOTER_VIEWPORT: ViewportSpec = {
   textTolerancePx: 44,
   attachmentTolerancePx: 56,
 };
+const MOBILE_VIEWPORT: ViewportSpec = {
+  name: "mobile",
+  width: 390,
+  height: 844,
+  textTolerancePx: 44,
+  attachmentTolerancePx: 56,
+};
 const COMPACT_FOOTER_VIEWPORT: ViewportSpec = {
   name: "compact-footer",
   width: 430,
@@ -3735,6 +3742,33 @@ describe("ChatView timeline estimator parity (full app)", () => {
     }
   });
 
+  it("creates a new draft thread from the mobile sidebar without hover", async () => {
+    const mounted = await mountChatView({
+      viewport: MOBILE_VIEWPORT,
+      snapshot: createSnapshotForTargetUser({
+        targetMessageId: "msg-user-mobile-new-thread-test" as MessageId,
+        targetText: "mobile new thread test",
+      }),
+    });
+
+    try {
+      await page.getByRole("button", { name: "Toggle Sidebar" }).click();
+
+      const newThreadButton = page.getByTestId("new-thread-button");
+      await expect.element(newThreadButton).toBeInTheDocument();
+      await expect.element(newThreadButton).toBeVisible();
+      await newThreadButton.click();
+
+      await waitForURL(
+        mounted.router,
+        (path) => UUID_ROUTE_RE.test(path),
+        "Mobile sidebar new-thread action should create a draft thread without hover.",
+      );
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
   it("canonicalizes stale promoted draft routes to the server thread route", async () => {
     const mounted = await mountChatView({
       viewport: DEFAULT_VIEWPORT,
@@ -5963,6 +5997,23 @@ describe("ChatView timeline estimator parity (full app)", () => {
       });
     } finally {
       releaseModShortcut("Control");
+      await mounted.cleanup();
+    }
+  });
+
+  it("uses a 16px composer font size on mobile viewports", async () => {
+    const mounted = await mountChatView({
+      viewport: MOBILE_VIEWPORT,
+      snapshot: createSnapshotForTargetUser({
+        targetMessageId: "msg-user-mobile-composer-font-test" as MessageId,
+        targetText: "mobile composer font test",
+      }),
+    });
+
+    try {
+      const composerEditor = await waitForComposerEditor();
+      expect(window.getComputedStyle(composerEditor).fontSize).toBe("16px");
+    } finally {
       await mounted.cleanup();
     }
   });

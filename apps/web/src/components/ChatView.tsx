@@ -3252,7 +3252,7 @@ export default function ChatView(props: ChatViewProps) {
                 reserveTitleBarControlInset &&
                   "wco:pr-[calc(100vw-env(titlebar-area-width)-env(titlebar-area-x)+1em)]",
               )
-            : "py-2 sm:py-3",
+            : "pb-2 pt-[calc(env(safe-area-inset-top)+0.5rem)] sm:py-3",
         )}
       >
         <ChatHeader

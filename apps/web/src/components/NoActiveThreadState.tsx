@@ -12,7 +12,7 @@ export function NoActiveThreadState() {
             "border-b border-border px-3 sm:px-5",
             isElectron
               ? "drag-region flex h-[52px] items-center wco:h-[env(titlebar-area-height)]"
-              : "py-2 sm:py-3",
+              : "pb-2 pt-[calc(env(safe-area-inset-top)+0.5rem)] sm:py-3",
           )}
         >
           {isElectron ? (
