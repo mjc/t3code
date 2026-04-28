@@ -136,7 +136,8 @@ function derivePendingUserInputCountFromActivities(
       activity.kind === "provider.user-input.respond.failed" &&
       detail !== null &&
       (detail.includes("stale pending user-input request") ||
-        detail.includes("unknown pending user-input request"))
+        detail.includes("unknown pending user-input request") ||
+        detail.includes("no provider resume state is persisted"))
     ) {
       openRequestIds.delete(requestId);
     }

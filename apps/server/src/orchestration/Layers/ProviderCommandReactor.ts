@@ -107,10 +107,11 @@ function isUnknownPendingApprovalRequestError(cause: Cause.Cause<ProviderService
       detail.includes("unknown pending permission request")
     );
   }
-  const message = Cause.pretty(cause);
+  const message = Cause.pretty(cause).toLowerCase();
   return (
     message.includes("unknown pending approval request") ||
-    message.includes("unknown pending permission request")
+    message.includes("unknown pending permission request") ||
+    message.includes("no provider resume state is persisted")
   );
 }
 
@@ -119,7 +120,11 @@ function isUnknownPendingUserInputRequestError(cause: Cause.Cause<ProviderServic
   if (error) {
     return error.detail.toLowerCase().includes("unknown pending user-input request");
   }
-  return Cause.pretty(cause).toLowerCase().includes("unknown pending user-input request");
+  const message = Cause.pretty(cause).toLowerCase();
+  return (
+    message.includes("unknown pending user-input request") ||
+    message.includes("no provider resume state is persisted")
+  );
 }
 
 function stalePendingRequestDetail(
