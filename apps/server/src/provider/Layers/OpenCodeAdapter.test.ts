@@ -203,11 +203,41 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
 
       assert.equal(session.provider, "opencode");
       assert.equal(session.threadId, "thread-opencode");
+      assert.deepEqual(session.resumeCursor, {
+        schemaVersion: 1,
+        sessionId: "http://127.0.0.1:9999/session",
+      });
       assert.deepEqual(runtimeMock.state.startCalls, []);
       assert.deepEqual(runtimeMock.state.sessionCreateUrls, ["http://127.0.0.1:9999"]);
       assert.deepEqual(runtimeMock.state.authHeaders, [
         `Basic ${btoa("opencode:secret-password")}`,
       ]);
+    }),
+  );
+
+  it.effect("resumes an existing OpenCode session from the persisted resume cursor", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+
+      const session = yield* adapter.startSession({
+        provider: "opencode",
+        threadId: asThreadId("thread-opencode-resume"),
+        runtimeMode: "full-access",
+        resumeCursor: {
+          schemaVersion: 1,
+          sessionId: "http://127.0.0.1:9999/restored-session",
+        },
+      });
+
+      assert.equal(session.provider, "opencode");
+      assert.equal(session.threadId, "thread-opencode-resume");
+      assert.deepEqual(session.resumeCursor, {
+        schemaVersion: 1,
+        sessionId: "http://127.0.0.1:9999/restored-session",
+      });
+      assert.deepEqual(runtimeMock.state.sessionCreateUrls, []);
+      assert.deepEqual(runtimeMock.state.authHeaders, []);
+      yield* adapter.stopSession(asThreadId("thread-opencode-resume"));
     }),
   );
 

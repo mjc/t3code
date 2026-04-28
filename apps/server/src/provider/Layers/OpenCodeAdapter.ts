@@ -97,6 +97,27 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function parseOpenCodeResumeCursor(raw: unknown): { sessionId: string } | undefined {
+  if (!raw || typeof raw !== "object") {
+    return undefined;
+  }
+  const sessionId =
+    "sessionId" in raw && typeof raw.sessionId === "string" && raw.sessionId.trim().length > 0
+      ? raw.sessionId.trim()
+      : undefined;
+  return sessionId ? { sessionId } : undefined;
+}
+
+function toOpenCodeResumeCursor(sessionId: string): {
+  readonly schemaVersion: 1;
+  readonly sessionId: string;
+} {
+  return {
+    schemaVersion: 1,
+    sessionId,
+  };
+}
+
 /**
  * Map a tagged OpenCodeRuntimeError produced by {@link runOpenCodeSdk} into
  * the adapter-boundary `ProviderAdapterRequestError`. SDK-method-level call
@@ -1009,6 +1030,7 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
             yield* stopOpenCodeContext(existing);
             sessions.delete(input.threadId);
           }
+          const resume = parseOpenCodeResumeCursor(input.resumeCursor);
 
           const started = yield* Effect.gen(function* () {
             const sessionScope = yield* Scope.make();
@@ -1026,6 +1048,18 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
                   directory,
                   ...(server.external && serverPassword ? { serverPassword } : {}),
                 });
+                if (resume) {
+                  yield* runOpenCodeSdk("session.messages", () =>
+                    client.session.messages({ sessionID: resume.sessionId }),
+                  );
+                  return {
+                    sessionScope,
+                    server,
+                    client,
+                    openCodeSession: { id: resume.sessionId },
+                    resumed: true as const,
+                  };
+                }
                 const openCodeSession = yield* runOpenCodeSdk("session.create", () =>
                   client.session.create({
                     title: `T3 Code ${input.threadId}`,
@@ -1038,7 +1072,13 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
                     detail: "OpenCode session.create returned no session payload.",
                   });
                 }
-                return { sessionScope, server, client, openCodeSession: openCodeSession.data };
+                return {
+                  sessionScope,
+                  server,
+                  client,
+                  openCodeSession: openCodeSession.data,
+                  resumed: false as const,
+                };
               }).pipe(Effect.provideService(Scope.Scope, sessionScope)),
             );
             if (Exit.isFailure(startedExit)) {
@@ -1069,6 +1109,7 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
             cwd: directory,
             ...(input.modelSelection ? { model: input.modelSelection.model } : {}),
             threadId: input.threadId,
+            resumeCursor: toOpenCodeResumeCursor(started.openCodeSession.id),
             createdAt,
             updatedAt: createdAt,
           };
@@ -1099,7 +1140,8 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
             ...buildEventBase({ threadId: input.threadId }),
             type: "session.started",
             payload: {
-              message: "OpenCode session started",
+              message: started.resumed ? "OpenCode session resumed" : "OpenCode session started",
+              resume: toOpenCodeResumeCursor(started.openCodeSession.id),
             },
           });
           yield* emit({
