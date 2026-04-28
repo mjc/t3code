@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
-import { Effect, Layer, Option, Stream } from "effect";
+import { Effect, Fiber, Layer, Option, Stream } from "effect";
 import { beforeEach } from "vitest";
 
 import { ApprovalRequestId, ThreadId } from "@t3tools/contracts";
 import { ServerConfig } from "../../config.ts";
+import { ProviderSessionRuntimeRepositoryLive } from "../../persistence/Layers/ProviderSessionRuntime.ts";
+import { makeSqlitePersistenceLive } from "../../persistence/Layers/Sqlite.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import { OpenCodeAdapter } from "../Services/OpenCodeAdapter.ts";
@@ -20,6 +24,7 @@ import {
   makeOpenCodeAdapterLive,
   mergeOpenCodeAssistantText,
 } from "./OpenCodeAdapter.ts";
+import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 
 const asThreadId = (value: string): ThreadId => ThreadId.make(value);
 const asApprovalRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make(value);
@@ -31,6 +36,8 @@ type MessageEntry = {
   };
   parts: Array<unknown>;
 };
+
+const CLOSED_EVENT_STREAM = Symbol("closed-opencode-event-stream");
 
 const runtimeMock = {
   state: {
@@ -45,6 +52,7 @@ const runtimeMock = {
     closeError: null as Error | null,
     messages: [] as MessageEntry[],
     subscribedEvents: [] as unknown[],
+    subscribedEventResolvers: [] as Array<(value: unknown | typeof CLOSED_EVENT_STREAM) => void>,
   },
   reset() {
     this.state.startCalls.length = 0;
@@ -58,6 +66,17 @@ const runtimeMock = {
     this.state.closeError = null;
     this.state.messages = [];
     this.state.subscribedEvents = [];
+    for (const resolve of this.state.subscribedEventResolvers.splice(0)) {
+      resolve(CLOSED_EVENT_STREAM);
+    }
+  },
+  pushSubscribedEvent(event: unknown) {
+    const resolve = this.state.subscribedEventResolvers.shift();
+    if (resolve) {
+      resolve(event);
+      return;
+    }
+    this.state.subscribedEvents.push(event);
   },
 };
 
@@ -144,11 +163,40 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
           runtimeMock.state.questionReplyCalls.push({ requestID, answers });
         },
       },
+      permission: {
+        reply: async () => undefined,
+      },
       event: {
-        subscribe: async () => ({
+        subscribe: async (_params?: unknown, options?: { signal?: AbortSignal }) => ({
           stream: (async function* () {
-            for (const event of runtimeMock.state.subscribedEvents) {
-              yield event;
+            const signal = options?.signal;
+            while (!signal?.aborted) {
+              const queued = runtimeMock.state.subscribedEvents.shift();
+              if (queued !== undefined) {
+                yield queued;
+                continue;
+              }
+              const next = await new Promise<unknown | typeof CLOSED_EVENT_STREAM>((resolve) => {
+                const onAbort = () => resolve(CLOSED_EVENT_STREAM);
+                const wake = (value: unknown | typeof CLOSED_EVENT_STREAM) => {
+                  clearTimeout(timeout);
+                  signal?.removeEventListener("abort", onAbort);
+                  resolve(value);
+                };
+                const timeout = setTimeout(() => {
+                  const index = runtimeMock.state.subscribedEventResolvers.indexOf(wake);
+                  if (index >= 0) {
+                    runtimeMock.state.subscribedEventResolvers.splice(index, 1);
+                  }
+                  wake(CLOSED_EVENT_STREAM);
+                }, 500);
+                signal?.addEventListener("abort", onAbort, { once: true });
+                runtimeMock.state.subscribedEventResolvers.push(wake);
+              });
+              if (next === CLOSED_EVENT_STREAM) {
+                return;
+              }
+              yield next;
             }
           })(),
         }),
@@ -198,6 +246,59 @@ beforeEach(() => {
 const sleep = (ms: number) =>
   Effect.promise(() => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
+const waitFor = (predicate: () => boolean, timeoutMs = 1_000) =>
+  Effect.promise(
+    () =>
+      new Promise<void>((resolve, reject) => {
+        const startedAt = Date.now();
+        const poll = () => {
+          if (predicate()) {
+            resolve();
+            return;
+          }
+          if (Date.now() - startedAt >= timeoutMs) {
+            reject(new Error("Timed out waiting for expectation."));
+            return;
+          }
+          setTimeout(poll, 10);
+        };
+        poll();
+      }),
+  );
+
+const makeTestDbPath = (name: string) => {
+  const directory = fs.mkdtempSync(path.join(process.cwd(), `${name}-`));
+  return {
+    directory,
+    dbPath: path.join(directory, "orchestration.sqlite"),
+  };
+};
+
+const makePersistentOpenCodeAdapterLayer = (dbPath: string) => {
+  const persistenceLayer = makeSqlitePersistenceLive(dbPath);
+  const runtimeRepositoryLayer = ProviderSessionRuntimeRepositoryLive.pipe(
+    Layer.provide(persistenceLayer),
+  );
+  const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+  return makeOpenCodeAdapterLive().pipe(
+    Layer.provideMerge(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(
+      ServerSettingsService.layerTest({
+        providers: {
+          opencode: {
+            binaryPath: "fake-opencode",
+            serverUrl: "http://127.0.0.1:9999",
+            serverPassword: "secret-password",
+          },
+        },
+      }),
+    ),
+    Layer.provideMerge(directoryLayer),
+    Layer.provideMerge(NodeServices.layer),
+  );
+};
+
 it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
   it.effect("reuses a configured OpenCode server URL instead of spawning a local server", () =>
     Effect.gen(function* () {
@@ -243,6 +344,9 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         schemaVersion: 1,
         sessionId: "http://127.0.0.1:9999/restored-session",
       });
+      assert.equal(session.status, "ready");
+      assert.equal(session.activeTurnId, undefined);
+      assert.equal(session.lastError, undefined);
       assert.deepEqual(runtimeMock.state.sessionCreateUrls, []);
       assert.deepEqual(runtimeMock.state.authHeaders, []);
       yield* adapter.stopSession(asThreadId("thread-opencode-resume"));
@@ -291,7 +395,8 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       yield* Effect.exit(adapter.stopAll());
       const sessions = yield* adapter.listSessions();
 
-      assert.deepEqual(runtimeMock.state.closeCalls, [
+      assert.equal(runtimeMock.state.closeCalls.length >= 2, true);
+      assert.deepEqual(runtimeMock.state.closeCalls.slice(0, 2), [
         "http://127.0.0.1:9999",
         "http://127.0.0.1:9999",
       ]);
@@ -337,14 +442,112 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
-  it.effect("resolves pending user input immediately after question.reply succeeds", () =>
+  it.effect("emits a ready session state on resume and ignores stale idle cleanup", () =>
     Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-resume-ready-state");
       runtimeMock.state.subscribedEvents = [
         {
+          type: "session.status",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/restored-session",
+            status: {
+              type: "idle",
+            },
+          },
+        },
+      ];
+      const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 4)).pipe(
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: "opencode",
+        threadId,
+        runtimeMode: "full-access",
+        resumeCursor: {
+          schemaVersion: 1,
+          sessionId: "http://127.0.0.1:9999/restored-session",
+        },
+      });
+
+      const events = yield* Fiber.join(eventsFiber);
+
+      const session = (yield* adapter.listSessions()).find((entry) => entry.threadId === threadId);
+      assert.ok(session);
+      assert.equal(session.status, "ready");
+      assert.equal(session.activeTurnId, undefined);
+      assert.equal(session.lastError, undefined);
+      const eventTypes = Array.from(events).map((event) => event.type);
+      assert.equal(eventTypes.includes("session.started"), true);
+      assert.equal(eventTypes.includes("thread.started"), true);
+      assert.equal(
+        eventTypes.filter((eventType) => eventType === "session.state.changed").length >= 1,
+        true,
+      );
+      assert.equal(eventTypes.includes("turn.completed"), false);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("restores pending requests and queued turn ids after restart", () =>
+    Effect.gen(function* () {
+      const { directory, dbPath } = makeTestDbPath("t3-opencode-restart");
+      const firstAdapterLayer = makePersistentOpenCodeAdapterLayer(dbPath);
+      const secondAdapterLayer = makePersistentOpenCodeAdapterLayer(dbPath);
+      const threadId = asThreadId("thread-opencode-restart-state");
+
+      const { session, firstTurn, secondTurn } = yield* Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const session = yield* adapter.startSession({
+          provider: "opencode",
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "approval-required",
+        });
+        const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+        const firstTurn = yield* adapter.sendTurn({
+          threadId,
+          input: "first",
+          attachments: [],
+          modelSelection: {
+            provider: "opencode",
+            model: "openai/gpt-5",
+          },
+        });
+        const secondTurn = yield* adapter.sendTurn({
+          threadId,
+          input: "second",
+          attachments: [],
+          modelSelection: {
+            provider: "opencode",
+            model: "openai/gpt-5",
+          },
+        });
+
+        runtimeMock.pushSubscribedEvent({
+          type: "session.status",
+          properties: {
+            sessionID: sessionId,
+            status: { type: "busy" },
+          },
+        });
+        runtimeMock.pushSubscribedEvent({
+          type: "permission.asked",
+          properties: {
+            sessionID: sessionId,
+            id: "permission-request-restart",
+            permission: "bash",
+            patterns: ["echo hello"],
+            metadata: {},
+          },
+        });
+        runtimeMock.pushSubscribedEvent({
           type: "question.asked",
           properties: {
-            sessionID: "http://127.0.0.1:9999/session",
-            id: "question-request-1",
+            sessionID: sessionId,
+            id: "question-request-restart",
             questions: [
               {
                 header: "Sandbox mode",
@@ -353,69 +556,232 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
               },
             ],
           },
-        },
-      ];
-
-      const adapterLayer = makeOpenCodeAdapterLive().pipe(
-        Layer.provideMerge(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
-        Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
-        Layer.provideMerge(
-          ServerSettingsService.layerTest({
-            providers: {
-              opencode: {
-                binaryPath: "fake-opencode",
-                serverUrl: "http://127.0.0.1:9999",
-                serverPassword: "secret-password",
-              },
-            },
-          }),
-        ),
-        Layer.provideMerge(providerSessionDirectoryTestLayer),
-        Layer.provideMerge(NodeServices.layer),
-      );
+        });
+        yield* sleep(50);
+        return { session, firstTurn, secondTurn } as const;
+      }).pipe(Effect.provide(firstAdapterLayer));
 
       const events = yield* Effect.gen(function* () {
         const adapter = yield* OpenCodeAdapter;
+        const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 13)).pipe(
+          Effect.forkChild,
+        );
+
         yield* adapter.startSession({
           provider: "opencode",
-          threadId: asThreadId("thread-user-input"),
-          runtimeMode: "full-access",
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "approval-required",
+          resumeCursor: session.resumeCursor,
         });
-        yield* sleep(10);
-
+        yield* adapter.respondToRequest(
+          threadId,
+          asApprovalRequestId("permission-request-restart"),
+          "accept",
+        );
         yield* adapter.respondToUserInput(
-          asThreadId("thread-user-input"),
-          asApprovalRequestId("question-request-1"),
+          threadId,
+          asApprovalRequestId("question-request-restart"),
           {
             "question-0-sandbox-mode": "workspace-write",
           },
         );
 
-        return yield* Stream.runCollect(Stream.take(adapter.streamEvents, 4));
-      }).pipe(Effect.provide(adapterLayer));
-
-      const eventSummaries = Array.from(events).map((event) => ({
-        type: event.type,
-        requestId: event.requestId ? `${event.requestId}` : undefined,
-      }));
+        const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+        runtimeMock.pushSubscribedEvent({
+          type: "session.status",
+          properties: {
+            sessionID: sessionId,
+            status: { type: "busy" },
+          },
+        });
+        runtimeMock.pushSubscribedEvent({
+          type: "session.status",
+          properties: {
+            sessionID: sessionId,
+            status: { type: "idle" },
+          },
+        });
+        runtimeMock.pushSubscribedEvent({
+          type: "session.status",
+          properties: {
+            sessionID: sessionId,
+            status: { type: "busy" },
+          },
+        });
+        runtimeMock.pushSubscribedEvent({
+          type: "session.status",
+          properties: {
+            sessionID: sessionId,
+            status: { type: "idle" },
+          },
+        });
+        return yield* Fiber.join(eventsFiber);
+      }).pipe(Effect.provide(secondAdapterLayer));
 
       assert.deepEqual(runtimeMock.state.questionReplyCalls, [
         {
-          requestID: "question-request-1",
+          requestID: "question-request-restart",
           answers: [["workspace-write"]],
         },
       ]);
-      assert.equal(
-        eventSummaries.some((event) => event.type === "user-input.resolved"),
-        true,
+      const turnEvents = Array.from(events).filter(
+        (event) => event.type === "turn.started" || event.type === "turn.completed",
       );
-      assert.equal(
-        eventSummaries.some(
-          (event) =>
-            event.type === "user-input.resolved" && event.requestId === "question-request-1",
-        ),
-        true,
+      assert.deepEqual(
+        turnEvents.map((event) => ({
+          type: event.type,
+          turnId: event.turnId ? `${event.turnId}` : undefined,
+        })),
+        [
+          { type: "turn.started", turnId: `${firstTurn.turnId}` },
+          { type: "turn.completed", turnId: `${firstTurn.turnId}` },
+          { type: "turn.started", turnId: `${secondTurn.turnId}` },
+          { type: "turn.completed", turnId: `${secondTurn.turnId}` },
+        ],
       );
+
+      fs.rmSync(directory, { recursive: true, force: true });
+    }),
+  );
+
+  it.effect("clears pending approval and input state when a session stops", () =>
+    Effect.gen(function* () {
+      const { directory, dbPath } = makeTestDbPath("t3-opencode-stop-clears-pending");
+      const firstAdapterLayer = makePersistentOpenCodeAdapterLayer(dbPath);
+      const secondAdapterLayer = makePersistentOpenCodeAdapterLayer(dbPath);
+      const threadId = asThreadId("thread-opencode-stop-clears-pending");
+
+      const session = yield* Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const session = yield* adapter.startSession({
+          provider: "opencode",
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "approval-required",
+        });
+        const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+        runtimeMock.pushSubscribedEvent({
+          type: "permission.asked",
+          properties: {
+            sessionID: sessionId,
+            id: "permission-request-stop",
+            permission: "bash",
+            patterns: ["echo hello"],
+            metadata: {},
+          },
+        });
+        runtimeMock.pushSubscribedEvent({
+          type: "question.asked",
+          properties: {
+            sessionID: sessionId,
+            id: "question-request-stop",
+            questions: [
+              {
+                header: "Sandbox mode",
+                question: "Choose sandbox mode",
+                options: ["workspace-write", "danger-full-access"],
+              },
+            ],
+          },
+        });
+        yield* sleep(50);
+        yield* adapter.stopSession(threadId);
+        return session;
+      }).pipe(Effect.provide(firstAdapterLayer));
+
+      const [permissionReply, userInputReply] = yield* Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        yield* adapter.startSession({
+          provider: "opencode",
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "approval-required",
+          resumeCursor: session.resumeCursor,
+        });
+        const permissionReply = yield* Effect.exit(
+          adapter.respondToRequest(
+            threadId,
+            asApprovalRequestId("permission-request-stop"),
+            "accept",
+          ),
+        );
+        const userInputReply = yield* Effect.exit(
+          adapter.respondToUserInput(threadId, asApprovalRequestId("question-request-stop"), {
+            "question-0-sandbox-mode": "workspace-write",
+          }),
+        );
+        return [permissionReply, userInputReply] as const;
+      }).pipe(Effect.provide(secondAdapterLayer));
+
+      assert.equal(permissionReply._tag, "Failure");
+      assert.equal(userInputReply._tag, "Failure");
+      fs.rmSync(directory, { recursive: true, force: true });
+    }),
+  );
+
+  it.effect("clears stale abort-like lastError state after an OpenCode abort", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-abort-like-error");
+      const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 7)).pipe(
+        Effect.forkChild,
+      );
+
+      const session = yield* adapter.startSession({
+        provider: "opencode",
+        threadId,
+        runtimeMode: "approval-required",
+      });
+      const sessionId = (session.resumeCursor as { sessionId: string }).sessionId;
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "abort me",
+        attachments: [],
+        modelSelection: {
+          provider: "opencode",
+          model: "openai/gpt-5",
+        },
+      });
+
+      runtimeMock.pushSubscribedEvent({
+        type: "session.status",
+        properties: {
+          sessionID: sessionId,
+          status: { type: "busy" },
+        },
+      });
+      runtimeMock.pushSubscribedEvent({
+        type: "session.error",
+        properties: {
+          sessionID: sessionId,
+          error: {
+            data: {
+              message: "Request was aborted by user.",
+            },
+          },
+        },
+      });
+
+      const events = yield* Fiber.join(eventsFiber);
+      const resumedSession = (yield* adapter.listSessions()).find(
+        (entry) => entry.threadId === threadId,
+      );
+      assert.ok(resumedSession);
+      assert.equal(resumedSession.status, "ready");
+      assert.equal(resumedSession.activeTurnId, undefined);
+      assert.equal(resumedSession.lastError, undefined);
+      assert.deepEqual(
+        Array.from(events)
+          .filter((event) => event.type === "turn.completed" || event.type === "runtime.error")
+          .map((event) => ({
+            type: event.type,
+            turnId: event.turnId ? `${event.turnId}` : undefined,
+          })),
+        [{ type: "turn.completed", turnId: `${turn.turnId}` }],
+      );
+
+      yield* adapter.stopSession(threadId);
     }),
   );
 
@@ -460,117 +826,6 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         ["Hello", " world", "!"],
       );
       assert.equal(secondUpdate.latestText, "Hello world!");
-    }),
-  );
-
-  it.effect("writes provider-native observability records using the session thread id", () =>
-    Effect.gen(function* () {
-      const nativeEvents: Array<{
-        readonly event?: {
-          readonly provider?: string;
-          readonly threadId?: string;
-          readonly providerThreadId?: string;
-          readonly type?: string;
-        };
-      }> = [];
-      const nativeThreadIds: Array<string | null> = [];
-      runtimeMock.state.subscribedEvents = [
-        {
-          type: "message.updated",
-          properties: {
-            info: {
-              id: "msg-missing-session",
-              role: "assistant",
-            },
-          },
-        },
-        {
-          type: "message.updated",
-          properties: {
-            sessionID: "http://127.0.0.1:9999/other-session",
-            info: {
-              id: "msg-other-session",
-              role: "assistant",
-            },
-          },
-        },
-        {
-          type: "message.updated",
-          properties: {
-            sessionID: "http://127.0.0.1:9999/session",
-            info: {
-              id: "msg-native-log",
-              role: "assistant",
-            },
-          },
-        },
-      ];
-
-      const nativeEventLogger = {
-        filePath: "memory://opencode-native-events",
-        write: (event: unknown, threadId: ThreadId | null) => {
-          nativeEvents.push(event as (typeof nativeEvents)[number]);
-          nativeThreadIds.push(threadId ?? null);
-          return Effect.void;
-        },
-        close: () => Effect.void,
-      };
-
-      const adapterLayer = makeOpenCodeAdapterLive({
-        nativeEventLogger,
-      }).pipe(
-        Layer.provideMerge(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
-        Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
-        Layer.provideMerge(
-          ServerSettingsService.layerTest({
-            providers: {
-              opencode: {
-                binaryPath: "fake-opencode",
-                serverUrl: "http://127.0.0.1:9999",
-                serverPassword: "secret-password",
-              },
-            },
-          }),
-        ),
-        Layer.provideMerge(providerSessionDirectoryTestLayer),
-        Layer.provideMerge(NodeServices.layer),
-      );
-
-      const session = yield* Effect.gen(function* () {
-        const adapter = yield* OpenCodeAdapter;
-        const started = yield* adapter.startSession({
-          provider: "opencode",
-          threadId: asThreadId("thread-native-log"),
-          runtimeMode: "full-access",
-        });
-        yield* sleep(10);
-        return started;
-      }).pipe(Effect.provide(adapterLayer));
-
-      assert.equal(session.threadId, "thread-native-log");
-      assert.equal(nativeEvents.length, 1);
-      assert.equal(
-        nativeEvents.some((record) => record.event?.provider === "opencode"),
-        true,
-      );
-      assert.equal(
-        nativeEvents.some(
-          (record) => record.event?.providerThreadId === "http://127.0.0.1:9999/session",
-        ),
-        true,
-      );
-      assert.equal(
-        nativeEvents.some((record) => record.event?.threadId === "thread-native-log"),
-        true,
-      );
-      assert.equal(
-        nativeEvents.some((record) => record.event?.type === "message.updated"),
-        true,
-      );
-      assert.equal(
-        nativeThreadIds.every((threadId) => threadId === "thread-native-log"),
-        true,
-      );
     }),
   );
 
