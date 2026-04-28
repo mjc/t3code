@@ -830,9 +830,12 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
 
           case "question.replied": {
             const request = context.pendingQuestions.get(event.properties.requestID);
+            if (!request) {
+              break;
+            }
             context.pendingQuestions.delete(event.properties.requestID);
             const answers = Object.fromEntries(
-              (request?.questions ?? []).map((question, index) => [
+              request.questions.map((question, index) => [
                 openCodeQuestionId(index, question),
                 event.properties.answers[index]?.join(", ") ?? "",
               ]),
@@ -851,6 +854,9 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           }
 
           case "question.rejected": {
+            if (!context.pendingQuestions.has(event.properties.requestID)) {
+              break;
+            }
             context.pendingQuestions.delete(event.properties.requestID);
             yield* emit({
               ...buildEventBase({
@@ -1314,12 +1320,30 @@ export function makeOpenCodeAdapterLive(options?: OpenCodeAdapterLiveOptions) {
           });
         }
 
+        const normalizedAnswers = toOpenCodeQuestionAnswers(request, answers);
         yield* runOpenCodeSdk("question.reply", () =>
           context.client.question.reply({
             requestID: requestId,
-            answers: toOpenCodeQuestionAnswers(request, answers),
+            answers: normalizedAnswers,
           }),
         ).pipe(Effect.mapError(toRequestError));
+        context.pendingQuestions.delete(requestId);
+        yield* emit({
+          ...buildEventBase({
+            threadId: context.session.threadId,
+            turnId: context.activeTurnId,
+            requestId,
+          }),
+          type: "user-input.resolved",
+          payload: {
+            answers: Object.fromEntries(
+              request.questions.map((question, index) => [
+                openCodeQuestionId(index, question),
+                normalizedAnswers[index]?.join(", ") ?? "",
+              ]),
+            ),
+          },
+        });
       });
 
       const stopSession: OpenCodeAdapterShape["stopSession"] = Effect.fn("stopSession")(

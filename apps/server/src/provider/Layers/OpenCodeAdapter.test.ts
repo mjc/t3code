@@ -2,10 +2,10 @@ import assert from "node:assert/strict";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
-import { Effect, Layer, Option } from "effect";
+import { Effect, Layer, Option, Stream } from "effect";
 import { beforeEach } from "vitest";
 
-import { ThreadId } from "@t3tools/contracts";
+import { ApprovalRequestId, ThreadId } from "@t3tools/contracts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
@@ -22,6 +22,7 @@ import {
 } from "./OpenCodeAdapter.ts";
 
 const asThreadId = (value: string): ThreadId => ThreadId.make(value);
+const asApprovalRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make(value);
 
 type MessageEntry = {
   info: {
@@ -38,6 +39,7 @@ const runtimeMock = {
     authHeaders: [] as Array<string | null>,
     abortCalls: [] as string[],
     closeCalls: [] as string[],
+    questionReplyCalls: [] as Array<{ requestID: string; answers: string[][] }>,
     revertCalls: [] as Array<{ sessionID: string; messageID?: string }>,
     promptAsyncError: null as Error | null,
     closeError: null as Error | null,
@@ -50,6 +52,7 @@ const runtimeMock = {
     this.state.authHeaders.length = 0;
     this.state.abortCalls.length = 0;
     this.state.closeCalls.length = 0;
+    this.state.questionReplyCalls.length = 0;
     this.state.revertCalls.length = 0;
     this.state.promptAsyncError = null;
     this.state.closeError = null;
@@ -134,6 +137,11 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
             targetIndex >= 0
               ? runtimeMock.state.messages.slice(0, targetIndex + 1)
               : runtimeMock.state.messages;
+        },
+      },
+      question: {
+        reply: async ({ requestID, answers }: { requestID: string; answers: string[][] }) => {
+          runtimeMock.state.questionReplyCalls.push({ requestID, answers });
         },
       },
       event: {
@@ -326,6 +334,88 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       assert.equal(sessions[0]?.status, "ready");
       assert.equal(sessions[0]?.activeTurnId, undefined);
       assert.equal(sessions[0]?.lastError, "prompt failed");
+    }),
+  );
+
+  it.effect("resolves pending user input immediately after question.reply succeeds", () =>
+    Effect.gen(function* () {
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "question.asked",
+          properties: {
+            sessionID: "http://127.0.0.1:9999/session",
+            id: "question-request-1",
+            questions: [
+              {
+                header: "Sandbox mode",
+                question: "Choose sandbox mode",
+                options: ["workspace-write", "danger-full-access"],
+              },
+            ],
+          },
+        },
+      ];
+
+      const adapterLayer = makeOpenCodeAdapterLive().pipe(
+        Layer.provideMerge(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
+        Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+        Layer.provideMerge(
+          ServerSettingsService.layerTest({
+            providers: {
+              opencode: {
+                binaryPath: "fake-opencode",
+                serverUrl: "http://127.0.0.1:9999",
+                serverPassword: "secret-password",
+              },
+            },
+          }),
+        ),
+        Layer.provideMerge(providerSessionDirectoryTestLayer),
+        Layer.provideMerge(NodeServices.layer),
+      );
+
+      const events = yield* Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        yield* adapter.startSession({
+          provider: "opencode",
+          threadId: asThreadId("thread-user-input"),
+          runtimeMode: "full-access",
+        });
+        yield* sleep(10);
+
+        yield* adapter.respondToUserInput(
+          asThreadId("thread-user-input"),
+          asApprovalRequestId("question-request-1"),
+          {
+            "question-0-sandbox-mode": "workspace-write",
+          },
+        );
+
+        return yield* Stream.runCollect(Stream.take(adapter.streamEvents, 4));
+      }).pipe(Effect.provide(adapterLayer));
+
+      const eventSummaries = Array.from(events).map((event) => ({
+        type: event.type,
+        requestId: event.requestId ? `${event.requestId}` : undefined,
+      }));
+
+      assert.deepEqual(runtimeMock.state.questionReplyCalls, [
+        {
+          requestID: "question-request-1",
+          answers: [["workspace-write"]],
+        },
+      ]);
+      assert.equal(
+        eventSummaries.some((event) => event.type === "user-input.resolved"),
+        true,
+      );
+      assert.equal(
+        eventSummaries.some(
+          (event) =>
+            event.type === "user-input.resolved" && event.requestId === "question-request-1",
+        ),
+        true,
+      );
     }),
   );
 
