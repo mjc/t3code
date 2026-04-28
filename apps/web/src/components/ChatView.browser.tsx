@@ -5509,7 +5509,7 @@ describe("ChatView timeline estimator parity (full app)", () => {
     }
   });
 
-  it("optimistically clears pending user input after submit command acceptance", async () => {
+  it("keeps pending user input visible until the server resolves it", async () => {
     const mounted = await mountChatView({
       viewport: DEFAULT_VIEWPORT,
       snapshot: createSnapshotWithFreeformPendingUserInput(),
@@ -5524,14 +5524,22 @@ describe("ChatView timeline estimator parity (full app)", () => {
     });
 
     try {
+      await vi.waitFor(
+        () => {
+          expect(document.body.textContent).toContain("What path should Copilot use?");
+          expect(document.body.textContent).toContain("Type your answer below.");
+        },
+        { timeout: 8_000, interval: 16 },
+      );
+
       await page.getByTestId("composer-editor").fill("src/cli");
       await waitForButtonContainingText("Submit");
       await page.getByRole("button", { name: /submit/i }).click();
 
       await vi.waitFor(
         () => {
-          expect(document.body.textContent).not.toContain("What path should Copilot use?");
-          expect(document.body.textContent).not.toContain("Type your answer below.");
+          expect(document.body.textContent).toContain("What path should Copilot use?");
+          expect(document.body.textContent).toContain("Type your answer below.");
         },
         { timeout: 8_000, interval: 16 },
       );

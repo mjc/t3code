@@ -684,17 +684,6 @@ const make = Effect.gen(function* () {
     if (!thread) {
       return;
     }
-    const hasSession = thread.session && thread.session.status !== "stopped";
-    if (!hasSession) {
-      return yield* appendProviderFailureActivity({
-        threadId: event.payload.threadId,
-        kind: "provider.turn.interrupt.failed",
-        summary: "Provider turn interrupt failed",
-        detail: "No active provider session is bound to this thread.",
-        turnId: event.payload.turnId ?? null,
-        createdAt: event.payload.createdAt,
-      });
-    }
 
     // Orchestration turn ids are not provider turn ids, so interrupt by session.
     yield* providerService.interruptTurn({ threadId: event.payload.threadId });
@@ -706,18 +695,6 @@ const make = Effect.gen(function* () {
     const thread = yield* resolveThread(event.payload.threadId);
     if (!thread) {
       return;
-    }
-    const hasSession = thread.session && thread.session.status !== "stopped";
-    if (!hasSession) {
-      return yield* appendProviderFailureActivity({
-        threadId: event.payload.threadId,
-        kind: "provider.approval.respond.failed",
-        summary: "Provider approval response failed",
-        detail: "No active provider session is bound to this thread.",
-        turnId: null,
-        createdAt: event.payload.createdAt,
-        requestId: event.payload.requestId,
-      });
     }
 
     yield* providerService
@@ -750,18 +727,6 @@ const make = Effect.gen(function* () {
       const thread = yield* resolveThread(event.payload.threadId);
       if (!thread) {
         return;
-      }
-      const hasSession = thread.session && thread.session.status !== "stopped";
-      if (!hasSession) {
-        return yield* appendProviderFailureActivity({
-          threadId: event.payload.threadId,
-          kind: "provider.user-input.respond.failed",
-          summary: "Provider user input response failed",
-          detail: "No active provider session is bound to this thread.",
-          turnId: null,
-          createdAt: event.payload.createdAt,
-          requestId: event.payload.requestId,
-        });
       }
 
       yield* providerService

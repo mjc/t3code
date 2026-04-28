@@ -1408,6 +1408,29 @@ describe("ProviderCommandReactor", () => {
     });
   });
 
+  it("forwards provider approval responses even when projected session state is missing", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.approval.respond",
+        commandId: CommandId.make("cmd-approval-respond-without-session"),
+        threadId: ThreadId.make("thread-1"),
+        requestId: asApprovalRequestId("approval-request-1"),
+        decision: "accept",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.respondToRequest.mock.calls.length === 1);
+    expect(harness.respondToRequest.mock.calls[0]?.[0]).toEqual({
+      threadId: "thread-1",
+      requestId: "approval-request-1",
+      decision: "accept",
+    });
+  });
+
   it("reacts to thread.user-input.respond by forwarding structured user input answers", async () => {
     const harness = await createHarness();
     const now = new Date().toISOString();
@@ -1434,6 +1457,33 @@ describe("ProviderCommandReactor", () => {
       harness.engine.dispatch({
         type: "thread.user-input.respond",
         commandId: CommandId.make("cmd-user-input-respond"),
+        threadId: ThreadId.make("thread-1"),
+        requestId: asApprovalRequestId("user-input-request-1"),
+        answers: {
+          sandbox_mode: "workspace-write",
+        },
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.respondToUserInput.mock.calls.length === 1);
+    expect(harness.respondToUserInput.mock.calls[0]?.[0]).toEqual({
+      threadId: "thread-1",
+      requestId: "user-input-request-1",
+      answers: {
+        sandbox_mode: "workspace-write",
+      },
+    });
+  });
+
+  it("forwards provider user-input responses even when projected session state is missing", async () => {
+    const harness = await createHarness();
+    const now = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.user-input.respond",
+        commandId: CommandId.make("cmd-user-input-respond-without-session"),
         threadId: ThreadId.make("thread-1"),
         requestId: asApprovalRequestId("user-input-request-1"),
         answers: {
