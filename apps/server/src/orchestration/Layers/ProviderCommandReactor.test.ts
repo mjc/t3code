@@ -14,7 +14,7 @@ import {
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
-import { Effect, Exit, Layer, ManagedRuntime, PubSub, Scope, Stream } from "effect";
+import { Effect, Exit, Layer, ManagedRuntime, Option, PubSub, Scope, Stream } from "effect";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { deriveServerPaths, ServerConfig } from "../../config.ts";
@@ -27,6 +27,11 @@ import {
   ProviderService,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
+import {
+  ProviderSessionDirectory,
+  type ProviderRuntimeBinding,
+  type ProviderSessionDirectoryShape,
+} from "../../provider/Services/ProviderSessionDirectory.ts";
 import { GitCore, type GitCoreShape } from "../../git/Services/GitCore.ts";
 import {
   GitStatusBroadcaster,
@@ -112,6 +117,7 @@ describe("ProviderCommandReactor", () => {
     const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
     let nextSessionIndex = 1;
     const runtimeSessions: Array<ProviderSession> = [];
+    const persistedBindings = new Map<ThreadId, ProviderRuntimeBinding>();
     const modelSelection = input?.threadModelSelection ?? {
       provider: "codex",
       model: "gpt-5-codex",
@@ -152,6 +158,15 @@ describe("ProviderCommandReactor", () => {
         updatedAt: now,
       };
       runtimeSessions.push(session);
+      persistedBindings.set(threadId, {
+        threadId,
+        provider: session.provider,
+        adapterKey: session.provider,
+        status: session.status === "ready" ? "running" : "stopped",
+        runtimeMode: session.runtimeMode,
+        resumeCursor: session.resumeCursor ?? null,
+        runtimePayload: null,
+      });
       return Effect.succeed(session);
     });
     const sendTurn = vi.fn((_: unknown) =>
@@ -242,6 +257,53 @@ describe("ProviderCommandReactor", () => {
         return Stream.fromPubSub(runtimeEventPubSub);
       },
     };
+    const providerSessionDirectory: ProviderSessionDirectoryShape = {
+      upsert: (binding) =>
+        Effect.sync(() => {
+          const existing = persistedBindings.get(binding.threadId);
+          const nextBinding: ProviderRuntimeBinding = {
+            threadId: binding.threadId,
+            provider: binding.provider,
+            resumeCursor:
+              binding.resumeCursor !== undefined
+                ? binding.resumeCursor
+                : (existing?.resumeCursor ?? null),
+            runtimePayload: binding.runtimePayload ?? existing?.runtimePayload ?? null,
+            ...(binding.adapterKey !== undefined
+              ? { adapterKey: binding.adapterKey }
+              : existing?.adapterKey !== undefined
+                ? { adapterKey: existing.adapterKey }
+                : {}),
+            ...(binding.status !== undefined
+              ? { status: binding.status }
+              : existing?.status !== undefined
+                ? { status: existing.status }
+                : {}),
+            ...(binding.runtimeMode !== undefined
+              ? { runtimeMode: binding.runtimeMode }
+              : existing?.runtimeMode !== undefined
+                ? { runtimeMode: existing.runtimeMode }
+                : {}),
+          };
+          persistedBindings.set(binding.threadId, nextBinding);
+        }),
+      getProvider: (threadId) =>
+        Effect.sync(() => {
+          const binding = persistedBindings.get(threadId);
+          if (!binding) {
+            throw new Error(`Missing binding for ${threadId}`);
+          }
+          return binding.provider;
+        }),
+      getBinding: (threadId) =>
+        Effect.succeed(
+          persistedBindings.has(threadId)
+            ? Option.some(persistedBindings.get(threadId)!)
+            : Option.none<ProviderRuntimeBinding>(),
+        ),
+      listThreadIds: () => Effect.succeed([...persistedBindings.keys()]),
+      listBindings: () => Effect.succeed([]),
+    };
 
     const orchestrationLayer = OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
@@ -259,6 +321,7 @@ describe("ProviderCommandReactor", () => {
       Layer.provideMerge(orchestrationLayer),
       Layer.provideMerge(projectionSnapshotLayer),
       Layer.provideMerge(Layer.succeed(ProviderService, service)),
+      Layer.provideMerge(Layer.succeed(ProviderSessionDirectory, providerSessionDirectory)),
       Layer.provideMerge(Layer.succeed(GitCore, { renameBranch } as unknown as GitCoreShape)),
       Layer.provideMerge(
         Layer.succeed(GitStatusBroadcaster, {
@@ -329,6 +392,8 @@ describe("ProviderCommandReactor", () => {
       generateBranchName,
       generateThreadTitle,
       stateDir,
+      persistedBindings,
+      runtimeSessions,
       drain,
     };
   }
@@ -370,6 +435,98 @@ describe("ProviderCommandReactor", () => {
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
     expect(thread?.session?.threadId).toBe("thread-1");
     expect(thread?.session?.runtimeMode).toBe("approval-required");
+  });
+
+  it("seeds recent transcript back into OpenCode when persisted resume state is missing", async () => {
+    const harness = await createHarness({
+      threadModelSelection: {
+        provider: "opencode",
+        model: "github-copilot/claude-opus-4.7",
+      },
+    });
+    const now = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-opencode-history-1"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-opencode-history-1"),
+          role: "user",
+          text: "Pick up the OpenCode resume investigation.",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+
+    harness.runtimeSessions.length = 0;
+    harness.persistedBindings.set(ThreadId.make("thread-1"), {
+      threadId: ThreadId.make("thread-1"),
+      provider: "opencode",
+      adapterKey: "opencode",
+      status: "stopped",
+      runtimeMode: "approval-required",
+      resumeCursor: null,
+      runtimePayload: null,
+    });
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-opencode-missing-resume"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "stopped",
+          providerName: "opencode",
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: "OpenCode server exited unexpectedly (0).",
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-opencode-history-2"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-opencode-history-2"),
+          role: "user",
+          text: "continue",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+    const secondSendTurnCall = harness.sendTurn.mock.calls[1]?.[0] as
+      | { input?: string; threadId?: ThreadId }
+      | undefined;
+    expect(harness.sendTurn.mock.calls[1]?.[0]).toMatchObject({
+      threadId: ThreadId.make("thread-1"),
+    });
+    expect(harness.sendTurn.mock.calls[1]?.[0]).toEqual(
+      expect.objectContaining({
+        input: expect.stringContaining(
+          "The previous OpenCode provider session for this T3 Code thread is unavailable",
+        ),
+      }),
+    );
+    expect(secondSendTurnCall?.input).toContain("User: Pick up the OpenCode resume investigation.");
+    expect(secondSendTurnCall?.input).toContain("continue");
   });
 
   it("generates a thread title on the first turn", async () => {

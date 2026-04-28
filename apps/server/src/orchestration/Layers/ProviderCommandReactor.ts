@@ -2,6 +2,7 @@ import {
   type ChatAttachment,
   CommandId,
   EventId,
+  MessageId,
   type ModelSelection,
   type OrchestrationEvent,
   type ProjectId,
@@ -22,6 +23,7 @@ import { GitStatusBroadcaster } from "../../git/Services/GitStatusBroadcaster.ts
 import { increment, orchestrationEventsProcessedTotal } from "../../observability/Metrics.ts";
 import { ProviderAdapterRequestError } from "../../provider/Errors.ts";
 import type { ProviderServiceError } from "../../provider/Errors.ts";
+import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
 import { TextGeneration } from "../../git/Services/TextGeneration.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
@@ -78,6 +80,8 @@ const HANDLED_TURN_START_KEY_MAX = 10_000;
 const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
 const DEFAULT_RUNTIME_MODE: RuntimeMode = "full-access";
 const DEFAULT_THREAD_TITLE = "New thread";
+const OPEN_CODE_RESUME_FALLBACK_MESSAGE_LIMIT = 12;
+const OPEN_CODE_RESUME_FALLBACK_CHAR_LIMIT = 12_000;
 
 function canReplaceThreadTitle(currentTitle: string, titleSeed?: string): boolean {
   const trimmedCurrentTitle = currentTitle.trim();
@@ -89,6 +93,58 @@ function canReplaceThreadTitle(currentTitle: string, titleSeed?: string): boolea
   return trimmedTitleSeed !== undefined && trimmedTitleSeed.length > 0
     ? trimmedCurrentTitle === trimmedTitleSeed
     : false;
+}
+
+function formatOpenCodeResumeFallbackTranscript(input: {
+  readonly messages: ReadonlyArray<{
+    readonly id: MessageId;
+    readonly role: "user" | "assistant" | "system";
+    readonly text: string;
+    readonly attachments: ReadonlyArray<unknown> | undefined;
+  }>;
+  readonly currentMessageId: MessageId;
+}): string | undefined {
+  const priorMessages = input.messages
+    .filter(
+      (message) =>
+        message.id !== input.currentMessageId &&
+        (message.role === "user" || message.role === "assistant"),
+    )
+    .map((message) => {
+      const text = message.text.trim();
+      const attachmentCount = message.attachments?.length ?? 0;
+      if (text.length === 0 && attachmentCount === 0) {
+        return null;
+      }
+      const attachmentNote = attachmentCount > 0 ? ` [attachments: ${attachmentCount}]` : "";
+      return `${message.role === "user" ? "User" : "Assistant"}${attachmentNote}: ${
+        text.length > 0 ? text : "(attachment-only message)"
+      }`;
+    })
+    .filter((message): message is string => message !== null);
+
+  if (priorMessages.length === 0) {
+    return undefined;
+  }
+
+  const recentMessages = priorMessages.slice(-OPEN_CODE_RESUME_FALLBACK_MESSAGE_LIMIT);
+  const recentTranscript = recentMessages.join("\n\n");
+  const truncatedTranscript = recentTranscript.slice(0, OPEN_CODE_RESUME_FALLBACK_CHAR_LIMIT);
+  const wasTrimmed =
+    priorMessages.length > recentMessages.length ||
+    truncatedTranscript.length < recentTranscript.length;
+
+  return [
+    "<system-reminder>",
+    "The previous OpenCode provider session for this T3 Code thread is unavailable, so native provider resume state could not be restored.",
+    "Continue from the recent transcript below instead of treating this as a brand new conversation.",
+    wasTrimmed
+      ? "This transcript is truncated to the most recent context that fit safely in the prompt."
+      : "This transcript contains the recent thread context available in T3 Code.",
+    "",
+    truncatedTranscript,
+    "</system-reminder>",
+  ].join("\n");
 }
 
 function findProviderAdapterRequestError(
@@ -161,6 +217,7 @@ const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
+  const providerSessionDirectory = yield* ProviderSessionDirectory;
   const git = yield* GitCore;
   const gitStatusBroadcaster = yield* GitStatusBroadcaster;
   const textGeneration = yield* TextGeneration;
@@ -414,6 +471,7 @@ const make = Effect.gen(function* () {
 
   const buildSendTurnRequestForThread = Effect.fnUntraced(function* (input: {
     readonly threadId: ThreadId;
+    readonly messageId: MessageId;
     readonly messageText: string;
     readonly attachments?: ReadonlyArray<ChatAttachment>;
     readonly modelSelection?: ModelSelection;
@@ -426,6 +484,10 @@ const make = Effect.gen(function* () {
         new Error(`Thread '${input.threadId}' was not found in read model.`),
       );
     }
+    const persistedBinding = yield* providerSessionDirectory.getBinding(input.threadId).pipe(
+      Effect.map(Option.getOrUndefined),
+      Effect.orElseSucceed(() => undefined),
+    );
     yield* ensureSessionForThread(
       input.threadId,
       input.createdAt,
@@ -456,10 +518,27 @@ const make = Effect.gen(function* () {
             }
           : requestedModelSelection
         : input.modelSelection;
+    const openCodeResumeFallbackTranscript =
+      requestedModelSelection.provider === "opencode" &&
+      (persistedBinding?.provider === "opencode" || persistedBinding === undefined) &&
+      (persistedBinding?.resumeCursor === null || persistedBinding?.resumeCursor === undefined)
+        ? formatOpenCodeResumeFallbackTranscript({
+            messages: thread.messages.map((message) => ({
+              id: message.id,
+              role: message.role,
+              text: message.text,
+              attachments: message.attachments,
+            })),
+            currentMessageId: input.messageId,
+          })
+        : undefined;
+    const effectiveInput = [openCodeResumeFallbackTranscript, normalizedInput]
+      .filter((part): part is string => typeof part === "string" && part.length > 0)
+      .join("\n\n");
 
     return {
       threadId: input.threadId,
-      ...(normalizedInput ? { input: normalizedInput } : {}),
+      ...(effectiveInput ? { input: effectiveInput } : {}),
       ...(normalizedAttachments.length > 0 ? { attachments: normalizedAttachments } : {}),
       ...(modelForTurn !== undefined ? { modelSelection: modelForTurn } : {}),
       ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
@@ -661,6 +740,7 @@ const make = Effect.gen(function* () {
 
     const sendTurnRequest = yield* buildSendTurnRequestForThread({
       threadId: event.payload.threadId,
+      messageId: event.payload.messageId,
       messageText: message.text,
       ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
       ...(event.payload.modelSelection !== undefined
