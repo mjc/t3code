@@ -2,7 +2,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import type { ModelSelection, ProviderRuntimeEvent, ProviderSession } from "@t3tools/contracts";
+import type {
+  ModelSelection,
+  OrchestrationEvent,
+  OrchestrationReadModel,
+  ProviderRuntimeEvent,
+  ProviderSession,
+} from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import {
   ApprovalRequestId,
@@ -45,6 +51,7 @@ import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQu
 import { ProviderCommandReactorLive } from "./ProviderCommandReactor.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
+import type { OrchestrationEngineShape } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ServerSettingsService } from "../../serverSettings.ts";
@@ -1103,6 +1110,192 @@ describe("ProviderCommandReactor", () => {
       },
       runtimeMode: "approval-required",
     });
+  });
+
+  it("uses the live read model when projection thread detail lags", async () => {
+    const now = new Date().toISOString();
+    const domainEvents = Effect.runSync(PubSub.unbounded<OrchestrationEvent>());
+    const startSession = vi.fn(() =>
+      Effect.succeed({
+        provider: "codex" as const,
+        status: "ready" as const,
+        runtimeMode: "approval-required" as const,
+        threadId: ThreadId.make("thread-1"),
+        createdAt: now,
+        updatedAt: now,
+      } satisfies ProviderSession),
+    );
+    const sendTurn = vi.fn(() =>
+      Effect.succeed({
+        threadId: ThreadId.make("thread-1"),
+        turnId: asTurnId("turn-1"),
+      }),
+    );
+    const dispatch = vi.fn(() => Effect.succeed({ sequence: 1 }));
+    const readModel: OrchestrationReadModel = {
+      snapshotSequence: 1,
+      updatedAt: now,
+      projects: [
+        {
+          id: asProjectId("project-1"),
+          title: "Provider Project",
+          workspaceRoot: "/tmp/provider-project",
+          repositoryIdentity: null,
+          defaultModelSelection: createModelSelection("codex", "gpt-5-codex"),
+          scripts: [],
+          createdAt: now,
+          updatedAt: now,
+          deletedAt: null,
+        },
+      ],
+      threads: [
+        {
+          id: ThreadId.make("thread-1"),
+          projectId: asProjectId("project-1"),
+          title: "Thread",
+          modelSelection: createModelSelection("codex", "gpt-5-codex"),
+          runtimeMode: "approval-required",
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          branch: null,
+          worktreePath: null,
+          latestTurn: null,
+          createdAt: now,
+          updatedAt: now,
+          archivedAt: null,
+          deletedAt: null,
+          session: null,
+          messages: [
+            {
+              id: asMessageId("user-message-1"),
+              role: "user",
+              text: "hello live read model",
+              turnId: null,
+              streaming: false,
+              createdAt: now,
+              updatedAt: now,
+            },
+          ],
+          proposedPlans: [],
+          activities: [],
+          checkpoints: [],
+        },
+      ],
+    };
+
+    const providerService: ProviderServiceShape = {
+      startSession: startSession as ProviderServiceShape["startSession"],
+      sendTurn: sendTurn as ProviderServiceShape["sendTurn"],
+      interruptTurn: () => Effect.void,
+      respondToRequest: () => Effect.void,
+      respondToUserInput: () => Effect.void,
+      stopSession: () => Effect.void,
+      listSessions: () => Effect.succeed([]),
+      getCapabilities: () => Effect.succeed({ sessionModelSwitch: "in-session" as const }),
+      rollbackConversation: () => Effect.die(new Error("unused")),
+      get streamEvents() {
+        return Stream.empty;
+      },
+    };
+    const providerSessionDirectory: ProviderSessionDirectoryShape = {
+      upsert: () => Effect.void,
+      getProvider: () => Effect.die(new Error("unused")),
+      getBinding: () => Effect.succeed(Option.none()),
+      listThreadIds: () => Effect.succeed([]),
+      listBindings: () => Effect.succeed([]),
+    };
+
+    runtime = ManagedRuntime.make(
+      ProviderCommandReactorLive.pipe(
+        Layer.provideMerge(
+          Layer.succeed(OrchestrationEngineService, {
+            getReadModel: () => Effect.succeed(readModel),
+            readEvents: () => Stream.empty,
+            dispatch: dispatch as OrchestrationEngineShape["dispatch"],
+            get streamDomainEvents() {
+              return Stream.fromPubSub(domainEvents);
+            },
+          } satisfies OrchestrationEngineShape),
+        ),
+        Layer.provideMerge(
+          Layer.succeed(ProjectionSnapshotQuery, {
+            getCommandReadModel: () => Effect.die("unused"),
+            getSnapshot: () => Effect.die("unused"),
+            getShellSnapshot: () => Effect.die("unused"),
+            getSnapshotSequence: () => Effect.die("unused"),
+            getCounts: () => Effect.die("unused"),
+            getActiveProjectByWorkspaceRoot: () => Effect.die("unused"),
+            getProjectShellById: () => Effect.succeed(Option.none()),
+            getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
+            getThreadCheckpointContext: () => Effect.die("unused"),
+            getThreadShellById: () => Effect.die("unused"),
+            getThreadDetailById: () => Effect.succeed(Option.none()),
+          }),
+        ),
+        Layer.provideMerge(Layer.succeed(ProviderService, providerService)),
+        Layer.provideMerge(Layer.succeed(ProviderSessionDirectory, providerSessionDirectory)),
+        Layer.provideMerge(
+          Layer.succeed(GitCore, { renameBranch: () => Effect.die("unused") } as never),
+        ),
+        Layer.provideMerge(
+          Layer.succeed(GitStatusBroadcaster, {
+            getStatus: () => Effect.die("unused"),
+            refreshLocalStatus: () => Effect.die("unused"),
+            refreshStatus: () => Effect.die("unused"),
+            streamStatus: () => Stream.die("unused"),
+          } satisfies GitStatusBroadcasterShape),
+        ),
+        Layer.provideMerge(
+          Layer.mock(TextGeneration, {
+            generateBranchName: () =>
+              Effect.fail(
+                new TextGenerationError({
+                  operation: "generateBranchName",
+                  detail: "disabled in test",
+                }),
+              ),
+            generateThreadTitle: () =>
+              Effect.fail(
+                new TextGenerationError({
+                  operation: "generateThreadTitle",
+                  detail: "disabled in test",
+                }),
+              ),
+          }),
+        ),
+        Layer.provideMerge(ServerSettingsService.layerTest()),
+      ),
+    );
+
+    const reactor = await runtime.runPromise(Effect.service(ProviderCommandReactor));
+    scope = await Effect.runPromise(Scope.make("sequential"));
+    await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    Effect.runSync(
+      PubSub.publish(domainEvents, {
+        sequence: 1,
+        eventId: EventId.make("evt-live-read-model"),
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        occurredAt: now,
+        commandId: CommandId.make("cmd-live-read-model"),
+        causationEventId: null,
+        correlationId: null,
+        metadata: {} as never,
+        type: "thread.turn-start-requested",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          messageId: asMessageId("user-message-1"),
+          runtimeMode: "approval-required",
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          createdAt: now,
+        },
+      } satisfies Extract<OrchestrationEvent, { type: "thread.turn-start-requested" }>),
+    );
+
+    await waitFor(() => startSession.mock.calls.length === 1);
+    await waitFor(() => sendTurn.mock.calls.length === 1);
+    expect(dispatch).toHaveBeenCalled();
   });
 
   it("restarts claude sessions when claude effort changes", async () => {

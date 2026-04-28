@@ -10,7 +10,11 @@
  *
  * @module OrchestrationEngineService
  */
-import type { OrchestrationCommand, OrchestrationEvent } from "@t3tools/contracts";
+import type {
+  OrchestrationCommand,
+  OrchestrationEvent,
+  OrchestrationReadModel,
+} from "@t3tools/contracts";
 import { Context } from "effect";
 import type { Effect, Stream } from "effect";
 
@@ -21,6 +25,14 @@ import type { OrchestrationEventStoreError } from "../../persistence/Errors.ts";
  * OrchestrationEngineShape - Service API for orchestration command and event flow.
  */
 export interface OrchestrationEngineShape {
+  /**
+   * Read the current in-memory orchestration read model.
+   *
+   * This is the live command-side view and may be fresher than the persisted
+   * projection snapshot while projectors are still catching up.
+   */
+  readonly getReadModel: () => Effect.Effect<OrchestrationReadModel, never, never>;
+
   /**
    * Replay persisted orchestration events from an exclusive sequence cursor.
    *

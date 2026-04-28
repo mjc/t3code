@@ -5,7 +5,6 @@ import {
   MessageId,
   type ModelSelection,
   type OrchestrationEvent,
-  type ProjectId,
   ProviderKind,
   type OrchestrationSession,
   ThreadId,
@@ -317,16 +316,9 @@ const make = Effect.gen(function* () {
     });
   });
 
-  const resolveProject = Effect.fnUntraced(function* (projectId: ProjectId) {
-    return yield* projectionSnapshotQuery
-      .getProjectShellById(projectId)
-      .pipe(Effect.map(Option.getOrUndefined));
-  });
-
   const resolveThread = Effect.fnUntraced(function* (threadId: ThreadId) {
-    return yield* projectionSnapshotQuery
-      .getThreadDetailById(threadId)
-      .pipe(Effect.map(Option.getOrUndefined));
+    const readModel = yield* orchestrationEngine.getReadModel();
+    return readModel.threads.find((entry) => entry.id === threadId);
   });
 
   const ensureSessionForThread = Effect.fn("ensureSessionForThread")(function* (
@@ -336,6 +328,7 @@ const make = Effect.gen(function* () {
       readonly modelSelection?: ModelSelection;
     },
   ) {
+    const readModel = yield* orchestrationEngine.getReadModel();
     const thread = yield* resolveThread(threadId);
     if (!thread) {
       return yield* Effect.die(new Error(`Thread '${threadId}' was not found in read model.`));
@@ -361,10 +354,9 @@ const make = Effect.gen(function* () {
     }
     const preferredProvider: ProviderKind = threadProvider;
     const desiredModelSelection = requestedModelSelection ?? thread.modelSelection;
-    const project = yield* resolveProject(thread.projectId);
     const effectiveCwd = resolveThreadWorkspaceCwd({
       thread,
-      projects: project ? [project] : [],
+      projects: readModel.projects,
     });
 
     const resolveActiveSession = (threadId: ThreadId) =>
@@ -523,7 +515,11 @@ const make = Effect.gen(function* () {
       (persistedBinding?.provider === "opencode" || persistedBinding === undefined) &&
       (persistedBinding?.resumeCursor === null || persistedBinding?.resumeCursor === undefined)
         ? formatOpenCodeResumeFallbackTranscript({
-            messages: thread.messages.map((message) => ({
+            messages: (
+              (yield* projectionSnapshotQuery
+                .getThreadDetailById(input.threadId)
+                .pipe(Effect.map(Option.getOrUndefined))) ?? thread
+            ).messages.map((message) => ({
               id: message.id,
               role: message.role,
               text: message.text,
@@ -674,11 +670,11 @@ const make = Effect.gen(function* () {
     const isFirstUserMessageTurn =
       thread.messages.filter((entry) => entry.role === "user").length === 1;
     if (isFirstUserMessageTurn) {
-      const project = yield* resolveProject(thread.projectId);
+      const readModel = yield* orchestrationEngine.getReadModel();
       const generationCwd =
         resolveThreadWorkspaceCwd({
           thread,
-          projects: project ? [project] : [],
+          projects: readModel.projects,
         }) ?? process.cwd();
       const generationInput = {
         messageText: message.text,

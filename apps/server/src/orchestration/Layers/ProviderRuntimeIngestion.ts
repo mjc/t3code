@@ -634,15 +634,14 @@ const make = Effect.gen(function* () {
     lookup: () => Effect.succeed({ text: "", createdAt: "" }),
   });
 
+  const resolveLiveThread = Effect.fn("resolveLiveThread")(function* (threadId: ThreadId) {
+    const readModel = yield* orchestrationEngine.getReadModel();
+    return readModel.threads.find((entry) => entry.id === threadId);
+  });
+
   const resolveThreadDetail = Effect.fn("resolveThreadDetail")(function* (threadId: ThreadId) {
     return yield* projectionSnapshotQuery
       .getThreadDetailById(threadId)
-      .pipe(Effect.map(Option.getOrUndefined));
-  });
-
-  const resolveThreadShell = Effect.fn("resolveThreadShell")(function* (threadId: ThreadId) {
-    return yield* projectionSnapshotQuery
-      .getThreadShellById(threadId)
       .pipe(Effect.map(Option.getOrUndefined));
   });
 
@@ -1147,7 +1146,8 @@ const make = Effect.gen(function* () {
       implementationThreadId: ThreadId,
       implementedAt: string,
     ) {
-      const sourceThread = yield* resolveThreadDetail(sourceThreadId);
+      const sourceThread =
+        (yield* resolveLiveThread(sourceThreadId)) ?? (yield* resolveThreadDetail(sourceThreadId));
       const sourcePlan = sourceThread?.proposedPlans.find((entry) => entry.id === sourcePlanId);
       if (!sourceThread || !sourcePlan || sourcePlan.implementedAt !== null) {
         return;
@@ -1172,16 +1172,16 @@ const make = Effect.gen(function* () {
 
   const processRuntimeEvent = (event: ProviderRuntimeEvent) =>
     Effect.gen(function* () {
-      const thread = yield* resolveThreadShell(event.threadId);
+      const thread = yield* resolveLiveThread(event.threadId);
       if (!thread) return;
 
       let loadedThreadDetail: OrchestrationThread | null | undefined;
       const getLoadedThreadDetail = () =>
-        Effect.gen(function* () {
+        Effect.sync(() => {
           if (loadedThreadDetail !== undefined) {
             return loadedThreadDetail;
           }
-          loadedThreadDetail = (yield* resolveThreadDetail(thread.id)) ?? null;
+          loadedThreadDetail = thread;
           return loadedThreadDetail;
         });
 
