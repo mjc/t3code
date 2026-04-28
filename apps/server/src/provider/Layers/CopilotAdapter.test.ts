@@ -835,6 +835,7 @@ it.layer(NodeServices.layer)("CopilotAdapterLive", (it) => {
         assert.ok(resumedSession);
         assert.equal(resumedSession.status, "ready");
         assert.equal(resumedSession.activeTurnId, undefined);
+        assert.equal(resumedSession.lastError, undefined);
 
         let thread = yield* secondAdapter.readThread(threadId);
         const restoredFirstTurn = thread.turns.find((entry) => entry.id === firstTurn.turnId);
@@ -933,6 +934,7 @@ it.layer(NodeServices.layer)("CopilotAdapterLive", (it) => {
         );
         assert.ok(resumedSession);
         assert.equal(resumedSession.activeTurnId, undefined);
+        assert.equal(resumedSession.lastError, undefined);
 
         yield* secondAdapter.stopSession(threadId);
       }).pipe(Effect.provide(secondAdapterLayer));
@@ -1070,6 +1072,7 @@ it.layer(NodeServices.layer)("CopilotAdapterLive", (it) => {
           assert.ok(resumedSession);
           assert.equal(resumedSession.status, "ready");
           assert.equal(resumedSession.activeTurnId, undefined);
+          assert.equal(resumedSession.lastError, undefined);
           assert.ok(!seenEvents.includes("turn.aborted"));
           assert.ok(!seenEvents.includes("turn.completed"));
 

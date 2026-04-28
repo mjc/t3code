@@ -1,4 +1,4 @@
-import { Cause, Duration, Effect, Layer, Option, Queue, Ref, Schema, Stream } from "effect";
+import { Cause, Duration, Effect, Layer, Option, Queue, Ref, Schema, Scope, Stream } from "effect";
 import {
   type AuthAccessStreamEvent,
   AuthSessionId,
@@ -10,6 +10,7 @@ import {
   OrchestrationDispatchCommandError,
   type OrchestrationEvent,
   type OrchestrationShellStreamEvent,
+  type OrchestrationThread,
   OrchestrationGetFullThreadDiffError,
   OrchestrationGetSnapshotError,
   OrchestrationGetTurnDiffError,
@@ -84,6 +85,93 @@ function isThreadDetailEvent(event: OrchestrationEvent): event is Extract<
     event.type === "thread.reverted" ||
     event.type === "thread.session-set"
   );
+}
+
+type ThreadDetailDomainEvent = Extract<
+  OrchestrationEvent,
+  {
+    type:
+      | "thread.message-sent"
+      | "thread.proposed-plan-upserted"
+      | "thread.activity-appended"
+      | "thread.turn-diff-completed"
+      | "thread.reverted"
+      | "thread.session-set";
+  }
+>;
+
+export type ThreadDetailStreamItem =
+  | {
+      readonly kind: "snapshot";
+      readonly snapshot: {
+        readonly snapshotSequence: number;
+        readonly thread: OrchestrationThread;
+      };
+    }
+  | {
+      readonly kind: "event";
+      readonly event: ThreadDetailDomainEvent;
+    };
+
+export function buildThreadSubscriptionStream(input: {
+  readonly threadId: ThreadId;
+  readonly getThreadDetail: Effect.Effect<
+    Option.Option<OrchestrationThread>,
+    OrchestrationGetSnapshotError
+  >;
+  readonly getSnapshotSequence: Effect.Effect<number, OrchestrationGetSnapshotError>;
+  readonly streamDomainEvents: Stream.Stream<OrchestrationEvent>;
+}): Effect.Effect<
+  Stream.Stream<ThreadDetailStreamItem>,
+  OrchestrationGetSnapshotError,
+  Scope.Scope
+> {
+  return Effect.gen(function* () {
+    const liveEventQueue =
+      yield* Queue.unbounded<Extract<ThreadDetailStreamItem, { kind: "event" }>>();
+    yield* Effect.forkScoped(
+      Stream.runForEach(
+        input.streamDomainEvents.pipe(
+          Stream.filter(
+            (event): event is ThreadDetailDomainEvent =>
+              event.aggregateKind === "thread" &&
+              event.aggregateId === input.threadId &&
+              isThreadDetailEvent(event),
+          ),
+          Stream.map((event) => ({
+            kind: "event" as const,
+            event,
+          })),
+        ),
+        (item) => Queue.offer(liveEventQueue, item),
+      ),
+    );
+
+    const [threadDetail, snapshotSequence] = yield* Effect.all([
+      input.getThreadDetail,
+      input.getSnapshotSequence,
+    ]);
+
+    if (Option.isNone(threadDetail)) {
+      return yield* new OrchestrationGetSnapshotError({
+        message: `Thread ${input.threadId} was not found`,
+        cause: input.threadId,
+      });
+    }
+
+    return Stream.concat(
+      Stream.make({
+        kind: "snapshot" as const,
+        snapshot: {
+          snapshotSequence,
+          thread: threadDetail.value,
+        },
+      }),
+      Stream.fromQueue(liveEventQueue).pipe(
+        Stream.filter((item) => item.event.sequence > snapshotSequence),
+      ),
+    );
+  });
 }
 
 const PROVIDER_STATUS_DEBOUNCE_MS = 200;
@@ -700,59 +788,28 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
         [ORCHESTRATION_WS_METHODS.subscribeThread]: (input) =>
           observeRpcStreamEffect(
             ORCHESTRATION_WS_METHODS.subscribeThread,
-            Effect.gen(function* () {
-              const [threadDetail, snapshotSequence] = yield* Effect.all([
-                projectionSnapshotQuery.getThreadDetailById(input.threadId).pipe(
-                  Effect.mapError(
-                    (cause) =>
-                      new OrchestrationGetSnapshotError({
-                        message: `Failed to load thread ${input.threadId}`,
-                        cause,
-                      }),
-                  ),
+            buildThreadSubscriptionStream({
+              threadId: input.threadId,
+              getThreadDetail: projectionSnapshotQuery.getThreadDetailById(input.threadId).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationGetSnapshotError({
+                      message: `Failed to load thread ${input.threadId}`,
+                      cause,
+                    }),
                 ),
-                projectionSnapshotQuery.getSnapshotSequence().pipe(
-                  Effect.map(({ snapshotSequence }) => snapshotSequence),
-                  Effect.mapError(
-                    (cause) =>
-                      new OrchestrationGetSnapshotError({
-                        message: "Failed to load orchestration snapshot sequence",
-                        cause,
-                      }),
-                  ),
+              ),
+              getSnapshotSequence: projectionSnapshotQuery.getSnapshotSequence().pipe(
+                Effect.map(({ snapshotSequence }) => snapshotSequence),
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationGetSnapshotError({
+                      message: "Failed to load orchestration snapshot sequence",
+                      cause,
+                    }),
                 ),
-              ]);
-
-              if (Option.isNone(threadDetail)) {
-                return yield* new OrchestrationGetSnapshotError({
-                  message: `Thread ${input.threadId} was not found`,
-                  cause: input.threadId,
-                });
-              }
-
-              const liveStream = orchestrationEngine.streamDomainEvents.pipe(
-                Stream.filter(
-                  (event) =>
-                    event.aggregateKind === "thread" &&
-                    event.aggregateId === input.threadId &&
-                    isThreadDetailEvent(event),
-                ),
-                Stream.map((event) => ({
-                  kind: "event" as const,
-                  event,
-                })),
-              );
-
-              return Stream.concat(
-                Stream.make({
-                  kind: "snapshot" as const,
-                  snapshot: {
-                    snapshotSequence,
-                    thread: threadDetail.value,
-                  },
-                }),
-                liveStream,
-              );
+              ),
+              streamDomainEvents: orchestrationEngine.streamDomainEvents,
             }),
             { "rpc.aggregate": "orchestration" },
           ),

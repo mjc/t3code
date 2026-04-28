@@ -1599,6 +1599,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
           case "session.resume": {
             updateProviderSession(context, {
               status: "ready",
+              lastError: null,
               model: trimOrUndefined(event.data.selectedModel) ?? context.session.model,
               ...(event.data.context?.cwd ? { cwd: event.data.context.cwd } : {}),
               resumeCursor: toCopilotResumeCursor(context.sdkSession.sessionId),
