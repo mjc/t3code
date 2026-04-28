@@ -5509,6 +5509,40 @@ describe("ChatView timeline estimator parity (full app)", () => {
     }
   });
 
+  it("keeps pending user input in submitting state until the request clears", async () => {
+    const mounted = await mountChatView({
+      viewport: DEFAULT_VIEWPORT,
+      snapshot: createSnapshotWithFreeformPendingUserInput(),
+      resolveRpc: (body) => {
+        if (body._tag === ORCHESTRATION_WS_METHODS.dispatchCommand) {
+          return {
+            sequence: fixture.snapshot.snapshotSequence + 1,
+          };
+        }
+        return undefined;
+      },
+    });
+
+    try {
+      await page.getByTestId("composer-editor").fill("src/cli");
+      await waitForButtonContainingText("Submit");
+      await page.getByRole("button", { name: /submit/i }).click();
+
+      await vi.waitFor(
+        () => {
+          const submitButton = page.getByRole("button", { name: /submitting/i });
+          expect(submitButton).toBeTruthy();
+        },
+        { timeout: 8_000, interval: 16 },
+      );
+
+      await new Promise((resolve) => window.setTimeout(resolve, 1_500));
+      expect(document.body.textContent).toContain("Submitting...");
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
   it("submits pending user input after the final option selection resolves the draft answers", async () => {
     const mounted = await mountChatView({
       viewport: DEFAULT_VIEWPORT,

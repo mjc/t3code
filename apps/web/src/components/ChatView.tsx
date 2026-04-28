@@ -1105,6 +1105,13 @@ export default function ChatView(props: ChatViewProps) {
   const activePendingIsResponding = activePendingUserInput
     ? respondingUserInputRequestIds.includes(activePendingUserInput.requestId)
     : false;
+  useEffect(() => {
+    const pendingRequestIds = new Set(pendingUserInputs.map((input) => input.requestId));
+    setRespondingUserInputRequestIds((existing) => {
+      const next = existing.filter((id) => pendingRequestIds.has(id));
+      return next.length === existing.length ? existing : next;
+    });
+  }, [pendingUserInputs]);
   const activeProposedPlan = useMemo(() => {
     if (!latestTurnSettled) {
       return null;
@@ -2735,8 +2742,8 @@ export default function ChatView(props: ChatViewProps) {
             activeThreadId,
             err instanceof Error ? err.message : "Failed to submit user input.",
           );
+          setRespondingUserInputRequestIds((existing) => existing.filter((id) => id !== requestId));
         });
-      setRespondingUserInputRequestIds((existing) => existing.filter((id) => id !== requestId));
     },
     [activeThreadId, environmentId, setThreadError],
   );
@@ -3356,6 +3363,7 @@ export default function ChatView(props: ChatViewProps) {
               activePendingDraftAnswers={activePendingDraftAnswers}
               activePendingQuestionIndex={activePendingQuestionIndex}
               respondingRequestIds={respondingRequestIds}
+              respondingUserInputRequestIds={respondingUserInputRequestIds}
               showPlanFollowUpPrompt={showPlanFollowUpPrompt}
               activeProposedPlan={activeProposedPlan}
               activePlan={activePlan as { turnId?: TurnId } | null}
