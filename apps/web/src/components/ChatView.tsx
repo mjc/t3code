@@ -678,6 +678,9 @@ export default function ChatView(props: ChatViewProps) {
   const [respondingUserInputRequestIds, setRespondingUserInputRequestIds] = useState<
     ApprovalRequestId[]
   >([]);
+  const [locallyResolvedUserInputRequestIds, setLocallyResolvedUserInputRequestIds] = useState<
+    ApprovalRequestId[]
+  >([]);
   const [pendingUserInputAnswersByRequestId, setPendingUserInputAnswersByRequestId] = useState<
     Record<string, Record<string, PendingUserInputDraftAnswer>>
   >({});
@@ -1068,9 +1071,18 @@ export default function ChatView(props: ChatViewProps) {
     () => derivePendingApprovals(threadActivities),
     [threadActivities],
   );
-  const pendingUserInputs = useMemo(
+  const pendingUserInputsFromActivities = useMemo(
     () => derivePendingUserInputs(threadActivities),
     [threadActivities],
+  );
+  const pendingUserInputs = useMemo(
+    () =>
+      locallyResolvedUserInputRequestIds.length === 0
+        ? pendingUserInputsFromActivities
+        : pendingUserInputsFromActivities.filter(
+            (input) => !locallyResolvedUserInputRequestIds.includes(input.requestId),
+          ),
+    [locallyResolvedUserInputRequestIds, pendingUserInputsFromActivities],
   );
   const activePendingUserInput = pendingUserInputs[0] ?? null;
   const activePendingDraftAnswers = useMemo(
@@ -1112,6 +1124,18 @@ export default function ChatView(props: ChatViewProps) {
       return next.length === existing.length ? existing : next;
     });
   }, [pendingUserInputs]);
+  useEffect(() => {
+    const pendingRequestIds = new Set(
+      pendingUserInputsFromActivities.map((input) => input.requestId),
+    );
+    setLocallyResolvedUserInputRequestIds((existing) => {
+      const next = existing.filter((id) => pendingRequestIds.has(id));
+      return next.length === existing.length ? existing : next;
+    });
+  }, [pendingUserInputsFromActivities]);
+  useEffect(() => {
+    setLocallyResolvedUserInputRequestIds([]);
+  }, [activeThreadId]);
   const activeProposedPlan = useMemo(() => {
     if (!latestTurnSettled) {
       return null;
@@ -2744,6 +2768,10 @@ export default function ChatView(props: ChatViewProps) {
           );
           setRespondingUserInputRequestIds((existing) => existing.filter((id) => id !== requestId));
         });
+      setRespondingUserInputRequestIds((existing) => existing.filter((id) => id !== requestId));
+      setLocallyResolvedUserInputRequestIds((existing) =>
+        existing.includes(requestId) ? existing : [...existing, requestId],
+      );
     },
     [activeThreadId, environmentId, setThreadError],
   );
