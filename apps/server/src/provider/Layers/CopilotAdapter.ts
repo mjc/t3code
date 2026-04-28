@@ -109,6 +109,7 @@ interface PersistedCopilotState {
   readonly schemaVersion: 1;
   readonly turns: Array<CopilotTurnSnapshot>;
   readonly queuedTurnIds: Array<TurnId>;
+  readonly completedTurnIds: Array<TurnId>;
   readonly currentTurnId: TurnId | undefined;
   readonly turnStartPayloadByTurnId: Array<readonly [TurnId, CopilotTurnStartPayload]>;
   readonly pendingTaskCompletionTextByTurnId: Array<readonly [TurnId, string]>;
@@ -409,6 +410,16 @@ function readPersistedTurnTextMap(value: unknown): Array<readonly [TurnId, strin
   });
 }
 
+function readPersistedTurnIdArray(value: unknown): Array<TurnId> {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((entry) => {
+    const turnId = readPersistedTurnId(entry);
+    return turnId ? [turnId] : [];
+  });
+}
+
 function readPersistedCopilotState(runtimePayload: unknown): PersistedCopilotState | undefined {
   if (!isRecord(runtimePayload)) {
     return undefined;
@@ -417,17 +428,14 @@ function readPersistedCopilotState(runtimePayload: unknown): PersistedCopilotSta
   if (!isRecord(rawState) || rawState.schemaVersion !== COPILOT_RUNTIME_STATE_SCHEMA_VERSION) {
     return undefined;
   }
-  const queuedTurnIds = Array.isArray(rawState.queuedTurnIds)
-    ? rawState.queuedTurnIds.flatMap((entry) => {
-        const turnId = readPersistedTurnId(entry);
-        return turnId ? [turnId] : [];
-      })
-    : [];
+  const queuedTurnIds = readPersistedTurnIdArray(rawState.queuedTurnIds);
+  const completedTurnIds = readPersistedTurnIdArray(rawState.completedTurnIds);
   const currentTurnId = readPersistedTurnId(rawState.currentTurnId);
   return {
     schemaVersion: COPILOT_RUNTIME_STATE_SCHEMA_VERSION,
     turns: readPersistedTurns(rawState.turns),
     queuedTurnIds,
+    completedTurnIds,
     currentTurnId,
     turnStartPayloadByTurnId: readPersistedTurnStartPayloadByTurnId(
       rawState.turnStartPayloadByTurnId,
@@ -455,6 +463,7 @@ function toPersistedCopilotRuntimePayload(context: CopilotSessionContext): Recor
         items: [...turn.items],
       })),
       queuedTurnIds: [...context.queuedTurnIds],
+      completedTurnIds: [...context.completedTurnIds],
       currentTurnId: currentTurnId(context) ?? null,
       turnStartPayloadByTurnId: Object.fromEntries(context.turnStartPayloadByTurnId),
       pendingTaskCompletionTextByTurnId: Object.fromEntries(
@@ -2435,7 +2444,7 @@ export function makeCopilotAdapterLive(options?: CopilotAdapterLiveOptions) {
             queuedTurnIds: [...(persistedState?.queuedTurnIds ?? [])],
             turnStartPayloadByTurnId: new Map(persistedState?.turnStartPayloadByTurnId ?? []),
             sdkTurnIdsToTurnIds: new Map(),
-            completedTurnIds: new Set(),
+            completedTurnIds: new Set(persistedState?.completedTurnIds ?? []),
             turnUsageByTurnId: new Map(),
             pendingPermissionHandlersBySignature: new Map(),
             pendingPermissionEventsBySignature: new Map(),
