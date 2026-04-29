@@ -35,9 +35,14 @@ import { GitManager } from "./git/Services/GitManager.ts";
 import { GitStatusBroadcaster } from "./git/Services/GitStatusBroadcaster.ts";
 import { Keybindings } from "./keybindings.ts";
 import { Open, resolveAvailableEditors } from "./open.ts";
+import {
+  reconcileStaleProjectedRunningThread,
+  reconcileStaleProjectedRunningThreads,
+} from "./orchestration/Layers/StaleProjectedRunningThreadReconciliation.ts";
 import { normalizeDispatchCommand } from "./orchestration/Normalizer.ts";
 import { OrchestrationEngineService } from "./orchestration/Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./orchestration/Services/ProjectionSnapshotQuery.ts";
+import { ProviderService } from "./provider/Services/ProviderService.ts";
 import {
   observeRpcEffect,
   observeRpcStream,
@@ -74,6 +79,7 @@ function isThreadDetailEvent(event: OrchestrationEvent): event is Extract<
       | "thread.activity-appended"
       | "thread.turn-diff-completed"
       | "thread.reverted"
+      | "thread.turn-reconciled"
       | "thread.session-set";
   }
 > {
@@ -83,6 +89,7 @@ function isThreadDetailEvent(event: OrchestrationEvent): event is Extract<
     event.type === "thread.activity-appended" ||
     event.type === "thread.turn-diff-completed" ||
     event.type === "thread.reverted" ||
+    event.type === "thread.turn-reconciled" ||
     event.type === "thread.session-set"
   );
 }
@@ -96,6 +103,7 @@ type ThreadDetailDomainEvent = Extract<
       | "thread.activity-appended"
       | "thread.turn-diff-completed"
       | "thread.reverted"
+      | "thread.turn-reconciled"
       | "thread.session-set";
   }
 >;
@@ -229,6 +237,7 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
       const gitStatusBroadcaster = yield* GitStatusBroadcaster;
       const terminalManager = yield* TerminalManager;
       const providerRegistry = yield* ProviderRegistry;
+      const providerService = yield* ProviderService;
       const config = yield* ServerConfig;
       const lifecycleEvents = yield* ServerLifecycleEvents;
       const serverSettings = yield* ServerSettingsService;
@@ -758,7 +767,11 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
           observeRpcStreamEffect(
             ORCHESTRATION_WS_METHODS.subscribeShell,
             Effect.gen(function* () {
-              const snapshot = yield* projectionSnapshotQuery.getShellSnapshot().pipe(
+              const snapshot = yield* reconcileStaleProjectedRunningThreads.pipe(
+                Effect.provideService(ProjectionSnapshotQuery, projectionSnapshotQuery),
+                Effect.provideService(OrchestrationEngineService, orchestrationEngine),
+                Effect.provideService(ProviderService, providerService),
+                Effect.andThen(projectionSnapshotQuery.getShellSnapshot()),
                 Effect.mapError(
                   (cause) =>
                     new OrchestrationGetSnapshotError({
@@ -790,7 +803,11 @@ const makeWsRpcLayer = (currentSessionId: AuthSessionId) =>
             ORCHESTRATION_WS_METHODS.subscribeThread,
             buildThreadSubscriptionStream({
               threadId: input.threadId,
-              getThreadDetail: projectionSnapshotQuery.getThreadDetailById(input.threadId).pipe(
+              getThreadDetail: reconcileStaleProjectedRunningThread(input.threadId).pipe(
+                Effect.provideService(ProjectionSnapshotQuery, projectionSnapshotQuery),
+                Effect.provideService(OrchestrationEngineService, orchestrationEngine),
+                Effect.provideService(ProviderService, providerService),
+                Effect.andThen(projectionSnapshotQuery.getThreadDetailById(input.threadId)),
                 Effect.mapError(
                   (cause) =>
                     new OrchestrationGetSnapshotError({

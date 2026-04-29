@@ -1116,7 +1116,8 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           return;
         }
 
-        case "thread.turn-interrupt-requested": {
+        case "thread.turn-interrupt-requested":
+        case "thread.turn-reconciled": {
           if (event.payload.turnId === undefined) {
             return;
           }

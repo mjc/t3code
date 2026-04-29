@@ -219,11 +219,13 @@ it.effect("resolveAutoBootstrapWelcomeTargets creates a project and thread when 
 it.effect("reconciles stale projected running sessions when no live provider session exists", () =>
   Effect.gen(function* () {
     const dispatchCalls = yield* Ref.make<ReadonlyArray<string>>([]);
+    const projectedSequence = yield* Ref.make(0);
 
     yield* reconcileStaleProjectedRunningThreads.pipe(
       Effect.provideService(ProjectionSnapshotQuery, {
         getCommandReadModel: () => Effect.die("unused"),
-        getSnapshot: () =>
+        getSnapshot: () => Effect.die("unused"),
+        getShellSnapshot: () =>
           Effect.succeed({
             snapshotSequence: 1,
             updatedAt: "2026-04-29T00:00:00.000Z",
@@ -241,11 +243,6 @@ it.effect("reconciles stale projected running sessions when no live provider ses
                 createdAt: "2026-04-29T00:00:00.000Z",
                 updatedAt: "2026-04-29T00:00:00.000Z",
                 archivedAt: null,
-                deletedAt: null,
-                messages: [],
-                activities: [],
-                proposedPlans: [],
-                checkpoints: [],
                 session: {
                   threadId: ThreadId.make("thread-stale-running"),
                   status: "running",
@@ -263,11 +260,15 @@ it.effect("reconciles stale projected running sessions when no live provider ses
                   completedAt: null,
                   assistantMessageId: null,
                 },
+                latestUserMessageAt: null,
+                hasPendingApprovals: false,
+                hasPendingUserInput: false,
+                hasActionableProposedPlan: false,
               },
             ],
           } as never),
-        getShellSnapshot: () => Effect.die("unused"),
-        getSnapshotSequence: () => Effect.die("unused"),
+        getSnapshotSequence: () =>
+          Ref.get(projectedSequence).pipe(Effect.map((snapshotSequence) => ({ snapshotSequence }))),
         getCounts: () => Effect.die("unused"),
         getActiveProjectByWorkspaceRoot: () => Effect.die("unused"),
         getProjectShellById: () => Effect.die("unused"),
@@ -293,14 +294,15 @@ it.effect("reconciles stale projected running sessions when no live provider ses
         readEvents: () => Stream.empty,
         dispatch: (command) =>
           Ref.update(dispatchCalls, (calls) => [...calls, command.type]).pipe(
-            Effect.as({ sequence: 1 }),
+            Effect.andThen(Ref.updateAndGet(projectedSequence, (sequence) => sequence + 1)),
+            Effect.map((sequence) => ({ sequence })),
           ),
         streamDomainEvents: Stream.empty,
       } satisfies OrchestrationEngineShape),
     );
 
     assert.deepStrictEqual(yield* Ref.get(dispatchCalls), [
-      "thread.turn.interrupt",
+      "thread.turn.reconcile",
       "thread.session.set",
     ]);
   }),
@@ -315,7 +317,8 @@ it.effect(
       yield* reconcileStaleProjectedRunningThreads.pipe(
         Effect.provideService(ProjectionSnapshotQuery, {
           getCommandReadModel: () => Effect.die("unused"),
-          getSnapshot: () =>
+          getSnapshot: () => Effect.die("unused"),
+          getShellSnapshot: () =>
             Effect.succeed({
               snapshotSequence: 1,
               updatedAt: "2026-04-29T00:00:00.000Z",
@@ -333,11 +336,6 @@ it.effect(
                   createdAt: "2026-04-29T00:00:00.000Z",
                   updatedAt: "2026-04-29T00:00:00.000Z",
                   archivedAt: null,
-                  deletedAt: null,
-                  messages: [],
-                  activities: [],
-                  proposedPlans: [],
-                  checkpoints: [],
                   session: {
                     threadId: ThreadId.make("thread-live-running"),
                     status: "running",
@@ -355,11 +353,14 @@ it.effect(
                     completedAt: null,
                     assistantMessageId: null,
                   },
+                  latestUserMessageAt: null,
+                  hasPendingApprovals: false,
+                  hasPendingUserInput: false,
+                  hasActionableProposedPlan: false,
                 },
               ],
             } as never),
-          getShellSnapshot: () => Effect.die("unused"),
-          getSnapshotSequence: () => Effect.die("unused"),
+          getSnapshotSequence: () => Effect.succeed({ snapshotSequence: 0 }),
           getCounts: () => Effect.die("unused"),
           getActiveProjectByWorkspaceRoot: () => Effect.die("unused"),
           getProjectShellById: () => Effect.die("unused"),

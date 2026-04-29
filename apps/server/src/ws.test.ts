@@ -217,4 +217,49 @@ describe("buildThreadSubscriptionStream", () => {
       },
     });
   });
+
+  it("streams thread.turn-reconciled as a thread detail event", async () => {
+    const threadId = ThreadId.make("thread-reconciled");
+    const snapshot = createThreadSnapshot(threadId, false);
+    const reconciledEvent = makeEvent({
+      sequence: 2,
+      type: "thread.turn-reconciled",
+      aggregateKind: "thread",
+      aggregateId: threadId,
+      occurredAt: "2026-02-23T10:00:02.000Z",
+      commandId: "cmd-reconcile-1",
+      payload: {
+        threadId,
+        turnId: "turn-1",
+        createdAt: "2026-02-23T10:00:02.000Z",
+      },
+    });
+
+    const items = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const queue = yield* Queue.unbounded<OrchestrationEvent>();
+          yield* Queue.offer(queue, reconciledEvent);
+
+          const stream = yield* buildThreadSubscriptionStream({
+            threadId,
+            getThreadDetail: Effect.succeed(Option.some(snapshot)),
+            getSnapshotSequence: Effect.succeed(1),
+            streamDomainEvents: Stream.fromQueue(queue),
+          });
+
+          return Array.from(yield* Stream.runCollect(Stream.take(stream, 2)));
+        }),
+      ),
+    );
+
+    expect(items).toHaveLength(2);
+    expect(items[1]).toMatchObject({
+      kind: "event",
+      event: {
+        sequence: 2,
+        type: "thread.turn-reconciled",
+      },
+    });
+  });
 });

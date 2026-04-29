@@ -79,6 +79,7 @@ import {
   ProviderRegistry,
   type ProviderRegistryShape,
 } from "./provider/Services/ProviderRegistry.ts";
+import { ProviderService, type ProviderServiceShape } from "./provider/Services/ProviderService.ts";
 import { ServerLifecycleEvents, type ServerLifecycleEventsShape } from "./serverLifecycleEvents.ts";
 import { ServerRuntimeStartup, type ServerRuntimeStartupShape } from "./serverRuntimeStartup.ts";
 import { ServerSettingsService, type ServerSettingsShape } from "./serverSettings.ts";
@@ -335,6 +336,7 @@ const buildAppUnderTest = (options?: {
     serverRuntimeStartup?: Partial<ServerRuntimeStartupShape>;
     serverEnvironment?: Partial<ServerEnvironmentShape>;
     repositoryIdentityResolver?: Partial<RepositoryIdentityResolverShape>;
+    providerService?: Partial<ProviderServiceShape>;
   };
 }) =>
   Effect.gen(function* () {
@@ -459,6 +461,21 @@ const buildAppUnderTest = (options?: {
           dispatch: () => Effect.succeed({ sequence: 0 }),
           streamDomainEvents: Stream.empty,
           ...options?.layers?.orchestrationEngine,
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(ProviderService)({
+          startSession: () => Effect.die("unused"),
+          sendTurn: () => Effect.die("unused"),
+          interruptTurn: () => Effect.die("unused"),
+          respondToRequest: () => Effect.die("unused"),
+          respondToUserInput: () => Effect.die("unused"),
+          stopSession: () => Effect.die("unused"),
+          listSessions: () => Effect.succeed([]),
+          getCapabilities: () => Effect.die("unused"),
+          rollbackConversation: () => Effect.die("unused"),
+          streamEvents: Stream.empty,
+          ...options?.layers?.providerService,
         }),
       ),
       Layer.provide(

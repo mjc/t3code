@@ -355,6 +355,92 @@ describe("orchestration projector", () => {
     expect(afterUpdate.threads[0]?.updatedAt).toBe(updatedAt);
   });
 
+  it("marks the latest turn interrupted for thread.turn-reconciled events", async () => {
+    const createdAt = "2026-02-23T08:00:00.000Z";
+    const runningAt = "2026-02-23T08:00:01.000Z";
+    const reconciledAt = "2026-02-23T08:00:02.000Z";
+    const model = createEmptyReadModel(createdAt);
+
+    const afterCreate = await Effect.runPromise(
+      projectEvent(
+        model,
+        makeEvent({
+          sequence: 1,
+          type: "thread.created",
+          aggregateKind: "thread",
+          aggregateId: "thread-1",
+          occurredAt: createdAt,
+          commandId: "cmd-create",
+          payload: {
+            threadId: "thread-1",
+            projectId: "project-1",
+            title: "demo",
+            modelSelection: {
+              provider: "codex",
+              model: "gpt-5.3-codex",
+            },
+            runtimeMode: "full-access",
+            branch: null,
+            worktreePath: null,
+            createdAt,
+            updatedAt: createdAt,
+          },
+        }),
+      ),
+    );
+
+    const afterRunning = await Effect.runPromise(
+      projectEvent(
+        afterCreate,
+        makeEvent({
+          sequence: 2,
+          type: "thread.session-set",
+          aggregateKind: "thread",
+          aggregateId: "thread-1",
+          occurredAt: runningAt,
+          commandId: "cmd-running",
+          payload: {
+            threadId: "thread-1",
+            session: {
+              threadId: "thread-1",
+              status: "running",
+              providerName: "codex",
+              runtimeMode: "full-access",
+              activeTurnId: "turn-1",
+              lastError: null,
+              updatedAt: runningAt,
+            },
+          },
+        }),
+      ),
+    );
+
+    const afterReconciled = await Effect.runPromise(
+      projectEvent(
+        afterRunning,
+        makeEvent({
+          sequence: 3,
+          type: "thread.turn-reconciled",
+          aggregateKind: "thread",
+          aggregateId: "thread-1",
+          occurredAt: reconciledAt,
+          commandId: "cmd-reconcile",
+          payload: {
+            threadId: "thread-1",
+            turnId: "turn-1",
+            createdAt: reconciledAt,
+          },
+        }),
+      ),
+    );
+
+    expect(afterReconciled.threads[0]?.latestTurn).toMatchObject({
+      turnId: "turn-1",
+      state: "interrupted",
+      completedAt: reconciledAt,
+    });
+  });
+
   it("marks assistant messages completed with non-streaming updates", async () => {
     const createdAt = "2026-02-23T09:00:00.000Z";
     const deltaAt = "2026-02-23T09:00:01.000Z";

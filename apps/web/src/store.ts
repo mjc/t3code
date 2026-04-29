@@ -1326,7 +1326,8 @@ function applyEnvironmentOrchestrationEvent(
         updatedAt: event.occurredAt,
       }));
 
-    case "thread.turn-interrupt-requested": {
+    case "thread.turn-interrupt-requested":
+    case "thread.turn-reconciled": {
       if (event.payload.turnId === undefined) {
         return state;
       }
