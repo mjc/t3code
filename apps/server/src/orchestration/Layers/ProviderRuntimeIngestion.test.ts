@@ -337,6 +337,61 @@ describe("ProviderRuntimeIngestion", () => {
     expect(thread.session?.lastError).toBe("turn failed");
   });
 
+  it("falls back to projected thread detail when the live read model misses a completion event", async () => {
+    const harness = await createHarness();
+    const runningAt = new Date().toISOString();
+
+    await Effect.runPromise(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-running-live-miss"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          runtimeMode: "approval-required",
+          activeTurnId: asTurnId("turn-live-miss"),
+          updatedAt: runningAt,
+          lastError: null,
+        },
+        createdAt: runningAt,
+      }),
+    );
+
+    const liveMissEngine = harness.engine as {
+      getReadModel: typeof harness.engine.getReadModel;
+    };
+    const originalGetReadModel = liveMissEngine.getReadModel;
+    liveMissEngine.getReadModel = () =>
+      originalGetReadModel().pipe(
+        Effect.map((readModel) => ({
+          ...readModel,
+          threads: readModel.threads.filter((entry) => entry.id !== ThreadId.make("thread-1")),
+        })),
+      );
+
+    harness.emit({
+      type: "turn.completed",
+      eventId: asEventId("evt-turn-completed-live-miss"),
+      provider: "codex",
+      threadId: asThreadId("thread-1"),
+      createdAt: new Date().toISOString(),
+      turnId: asTurnId("turn-live-miss"),
+      payload: {
+        state: "completed",
+      },
+    });
+
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.status === "ready" && entry.session?.activeTurnId === null,
+    );
+
+    expect(thread.session?.status).toBe("ready");
+    expect(thread.session?.activeTurnId).toBeNull();
+  });
+
   it("applies provider session.state.changed transitions directly", async () => {
     const harness = await createHarness();
     const waitingAt = new Date().toISOString();

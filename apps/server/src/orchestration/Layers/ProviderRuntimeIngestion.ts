@@ -1172,7 +1172,8 @@ const make = Effect.gen(function* () {
 
   const processRuntimeEvent = (event: ProviderRuntimeEvent) =>
     Effect.gen(function* () {
-      const thread = yield* resolveLiveThread(event.threadId);
+      const thread =
+        (yield* resolveLiveThread(event.threadId)) ?? (yield* resolveThreadDetail(event.threadId));
       if (!thread) return;
 
       let loadedThreadDetail: OrchestrationThread | null | undefined;
