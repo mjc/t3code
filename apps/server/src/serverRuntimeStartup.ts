@@ -33,6 +33,7 @@ import { ServerEnvironment } from "./environment/Services/ServerEnvironment.ts";
 import { AnalyticsService } from "./telemetry/Services/AnalyticsService.ts";
 import { ServerAuth } from "./auth/Services/ServerAuth.ts";
 import { ProviderSessionReaper } from "./provider/Services/ProviderSessionReaper.ts";
+import { ProviderService } from "./provider/Services/ProviderService.ts";
 import {
   formatHeadlessServeOutput,
   formatHostForUrl,
@@ -152,6 +153,61 @@ export const launchStartupHeartbeat = recordStartupHeartbeat.pipe(
   Effect.forkScoped,
   Effect.asVoid,
 );
+
+export const reconcileStaleProjectedRunningThreads = Effect.gen(function* () {
+  const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
+  const orchestrationEngine = yield* OrchestrationEngineService;
+  const providerService = yield* ProviderService;
+
+  const [snapshot, liveSessions] = yield* Effect.all([
+    projectionSnapshotQuery.getSnapshot(),
+    providerService.listSessions(),
+  ]);
+
+  const liveThreadIds = new Set(liveSessions.map((session) => session.threadId));
+  const now = new Date().toISOString();
+
+  for (const thread of snapshot.threads) {
+    if (liveThreadIds.has(thread.id)) {
+      continue;
+    }
+
+    const staleRunningTurnId =
+      thread.session?.activeTurnId ??
+      (thread.latestTurn?.state === "running" ? thread.latestTurn.turnId : null);
+    const hasStaleRunningSession =
+      thread.session?.status === "running" || thread.session?.status === "starting";
+
+    if (staleRunningTurnId === null && !hasStaleRunningSession) {
+      continue;
+    }
+
+    if (staleRunningTurnId !== null) {
+      yield* orchestrationEngine.dispatch({
+        type: "thread.turn.interrupt",
+        commandId: CommandId.make(crypto.randomUUID()),
+        threadId: thread.id,
+        turnId: staleRunningTurnId,
+        createdAt: now,
+      });
+    }
+
+    if (thread.session && hasStaleRunningSession) {
+      yield* orchestrationEngine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make(crypto.randomUUID()),
+        threadId: thread.id,
+        session: {
+          ...thread.session,
+          status: staleRunningTurnId !== null ? "interrupted" : "stopped",
+          activeTurnId: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      });
+    }
+  }
+});
 
 export const getAutoBootstrapDefaultModelSelection = (): ModelSelection => ({
   provider: "codex",
@@ -331,6 +387,12 @@ export const makeServerRuntimeStartup = Effect.gen(function* () {
         yield* orchestrationReactor.start().pipe(Scope.provide(reactorScope));
         yield* providerSessionReaper.start().pipe(Scope.provide(reactorScope));
       }),
+    );
+
+    yield* Effect.logDebug("startup phase: reconciling stale projected running threads");
+    yield* runStartupPhase(
+      "sessions.reconcile-stale-running",
+      reconcileStaleProjectedRunningThreads,
     );
 
     const welcomeBase = yield* resolveWelcomeBase;

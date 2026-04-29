@@ -1,5 +1,5 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { DEFAULT_MODEL_BY_PROVIDER, ProjectId, ThreadId } from "@t3tools/contracts";
+import { DEFAULT_MODEL_BY_PROVIDER, ProjectId, ThreadId, TurnId } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import { Deferred, Effect, Fiber, Option, Ref, Stream } from "effect";
 
@@ -14,10 +14,12 @@ import {
   getAutoBootstrapDefaultModelSelection,
   launchStartupHeartbeat,
   makeCommandGate,
+  reconcileStaleProjectedRunningThreads,
   resolveAutoBootstrapWelcomeTargets,
   resolveWelcomeBase,
   ServerRuntimeStartupError,
 } from "./serverRuntimeStartup.ts";
+import { ProviderService } from "./provider/Services/ProviderService.ts";
 
 it("uses the canonical Codex default for auto-bootstrapped model selection", () => {
   assert.deepStrictEqual(getAutoBootstrapDefaultModelSelection(), {
@@ -212,4 +214,194 @@ it.effect("resolveAutoBootstrapWelcomeTargets creates a project and thread when 
     assert.equal(typeof targets.bootstrapThreadId, "string");
     assert.deepStrictEqual(yield* Ref.get(dispatchCalls), ["project.create", "thread.create"]);
   }),
+);
+
+it.effect("reconciles stale projected running sessions when no live provider session exists", () =>
+  Effect.gen(function* () {
+    const dispatchCalls = yield* Ref.make<ReadonlyArray<string>>([]);
+
+    yield* reconcileStaleProjectedRunningThreads.pipe(
+      Effect.provideService(ProjectionSnapshotQuery, {
+        getCommandReadModel: () => Effect.die("unused"),
+        getSnapshot: () =>
+          Effect.succeed({
+            snapshotSequence: 1,
+            updatedAt: "2026-04-29T00:00:00.000Z",
+            projects: [],
+            threads: [
+              {
+                id: ThreadId.make("thread-stale-running"),
+                projectId: ProjectId.make("project-1"),
+                title: "Stale Thread",
+                modelSelection: getAutoBootstrapDefaultModelSelection(),
+                runtimeMode: "full-access",
+                interactionMode: "default",
+                branch: null,
+                worktreePath: null,
+                createdAt: "2026-04-29T00:00:00.000Z",
+                updatedAt: "2026-04-29T00:00:00.000Z",
+                archivedAt: null,
+                deletedAt: null,
+                messages: [],
+                activities: [],
+                proposedPlans: [],
+                checkpoints: [],
+                session: {
+                  threadId: ThreadId.make("thread-stale-running"),
+                  status: "running",
+                  providerName: "codex",
+                  runtimeMode: "full-access",
+                  activeTurnId: "turn-stale-running",
+                  lastError: null,
+                  updatedAt: "2026-04-29T00:00:00.000Z",
+                },
+                latestTurn: {
+                  turnId: "turn-stale-running",
+                  state: "running",
+                  requestedAt: "2026-04-29T00:00:00.000Z",
+                  startedAt: "2026-04-29T00:00:01.000Z",
+                  completedAt: null,
+                  assistantMessageId: null,
+                },
+              },
+            ],
+          } as never),
+        getShellSnapshot: () => Effect.die("unused"),
+        getSnapshotSequence: () => Effect.die("unused"),
+        getCounts: () => Effect.die("unused"),
+        getActiveProjectByWorkspaceRoot: () => Effect.die("unused"),
+        getProjectShellById: () => Effect.die("unused"),
+        getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
+        getThreadCheckpointContext: () => Effect.succeed(Option.none()),
+        getThreadShellById: () => Effect.die("unused"),
+        getThreadDetailById: () => Effect.die("unused"),
+      }),
+      Effect.provideService(ProviderService, {
+        startSession: () => Effect.die("unused"),
+        sendTurn: () => Effect.die("unused"),
+        interruptTurn: () => Effect.die("unused"),
+        respondToRequest: () => Effect.die("unused"),
+        respondToUserInput: () => Effect.die("unused"),
+        stopSession: () => Effect.die("unused"),
+        listSessions: () => Effect.succeed([]),
+        getCapabilities: () => Effect.die("unused"),
+        rollbackConversation: () => Effect.die("unused"),
+        streamEvents: Stream.empty,
+      }),
+      Effect.provideService(OrchestrationEngineService, {
+        getReadModel: () => Effect.die("unused"),
+        readEvents: () => Stream.empty,
+        dispatch: (command) =>
+          Ref.update(dispatchCalls, (calls) => [...calls, command.type]).pipe(
+            Effect.as({ sequence: 1 }),
+          ),
+        streamDomainEvents: Stream.empty,
+      } satisfies OrchestrationEngineShape),
+    );
+
+    assert.deepStrictEqual(yield* Ref.get(dispatchCalls), [
+      "thread.turn.interrupt",
+      "thread.session.set",
+    ]);
+  }),
+);
+
+it.effect(
+  "does not reconcile projected running sessions that already have a live provider session",
+  () =>
+    Effect.gen(function* () {
+      const dispatchCalls = yield* Ref.make<ReadonlyArray<string>>([]);
+
+      yield* reconcileStaleProjectedRunningThreads.pipe(
+        Effect.provideService(ProjectionSnapshotQuery, {
+          getCommandReadModel: () => Effect.die("unused"),
+          getSnapshot: () =>
+            Effect.succeed({
+              snapshotSequence: 1,
+              updatedAt: "2026-04-29T00:00:00.000Z",
+              projects: [],
+              threads: [
+                {
+                  id: ThreadId.make("thread-live-running"),
+                  projectId: ProjectId.make("project-1"),
+                  title: "Live Thread",
+                  modelSelection: getAutoBootstrapDefaultModelSelection(),
+                  runtimeMode: "full-access",
+                  interactionMode: "default",
+                  branch: null,
+                  worktreePath: null,
+                  createdAt: "2026-04-29T00:00:00.000Z",
+                  updatedAt: "2026-04-29T00:00:00.000Z",
+                  archivedAt: null,
+                  deletedAt: null,
+                  messages: [],
+                  activities: [],
+                  proposedPlans: [],
+                  checkpoints: [],
+                  session: {
+                    threadId: ThreadId.make("thread-live-running"),
+                    status: "running",
+                    providerName: "codex",
+                    runtimeMode: "full-access",
+                    activeTurnId: "turn-live-running",
+                    lastError: null,
+                    updatedAt: "2026-04-29T00:00:00.000Z",
+                  },
+                  latestTurn: {
+                    turnId: "turn-live-running",
+                    state: "running",
+                    requestedAt: "2026-04-29T00:00:00.000Z",
+                    startedAt: "2026-04-29T00:00:01.000Z",
+                    completedAt: null,
+                    assistantMessageId: null,
+                  },
+                },
+              ],
+            } as never),
+          getShellSnapshot: () => Effect.die("unused"),
+          getSnapshotSequence: () => Effect.die("unused"),
+          getCounts: () => Effect.die("unused"),
+          getActiveProjectByWorkspaceRoot: () => Effect.die("unused"),
+          getProjectShellById: () => Effect.die("unused"),
+          getFirstActiveThreadIdByProjectId: () => Effect.die("unused"),
+          getThreadCheckpointContext: () => Effect.succeed(Option.none()),
+          getThreadShellById: () => Effect.die("unused"),
+          getThreadDetailById: () => Effect.die("unused"),
+        }),
+        Effect.provideService(ProviderService, {
+          startSession: () => Effect.die("unused"),
+          sendTurn: () => Effect.die("unused"),
+          interruptTurn: () => Effect.die("unused"),
+          respondToRequest: () => Effect.die("unused"),
+          respondToUserInput: () => Effect.die("unused"),
+          stopSession: () => Effect.die("unused"),
+          listSessions: () =>
+            Effect.succeed([
+              {
+                provider: "codex",
+                threadId: ThreadId.make("thread-live-running"),
+                status: "running",
+                runtimeMode: "full-access",
+                activeTurnId: TurnId.make("turn-live-running"),
+                createdAt: "2026-04-29T00:00:00.000Z",
+                updatedAt: "2026-04-29T00:00:00.000Z",
+              },
+            ]),
+          getCapabilities: () => Effect.die("unused"),
+          rollbackConversation: () => Effect.die("unused"),
+          streamEvents: Stream.empty,
+        }),
+        Effect.provideService(OrchestrationEngineService, {
+          getReadModel: () => Effect.die("unused"),
+          readEvents: () => Stream.empty,
+          dispatch: (command) =>
+            Ref.update(dispatchCalls, (calls) => [...calls, command.type]).pipe(
+              Effect.as({ sequence: 1 }),
+            ),
+          streamDomainEvents: Stream.empty,
+        } satisfies OrchestrationEngineShape),
+      );
+
+      assert.deepStrictEqual(yield* Ref.get(dispatchCalls), []);
+    }),
 );
